@@ -9,10 +9,53 @@ from backend.app.api.routes import router as api_router
 
 def reconcile_storage_and_quarantine():
     """
-    Reconciliação no startup (Task 1.3):
-    1. Limpa pastas residuais deixadas no diretório de quarentena devido a crashes ou quedas de energia.
-    2. Identifica projetos que possam ter permanecido com status 'deleting' caso o processo tenha caído antes do commit.
+    Reconciliação no startup (Task 1.3 / R1):
+    1. Inspeciona projetos que permaneceram com status 'deleting' (ex: queda de energia ou interrupção durante exclusão).
+       - Se a pasta do projeto ainda existe em STORAGE_DIR, restaura o status para 'active'.
+       - Se existe pasta correspondente na quarentena (.quarantine/{project_id}_*), restaura a pasta para o projeto e volta para 'active'.
+       - Se nenhuma pasta existir nem no storage nem na quarentena, finaliza a remoção do projeto e seus jobs no SQLite.
+    2. Após reconciliar os projetos, limpa quaisquer pastas órfãs residuais no diretório de quarentena.
     """
+    db = SessionLocal()
+    try:
+        deleting_projects = db.query(ProjectModel).filter(ProjectModel.status == "deleting").all()
+        quarantine_dir = settings.QUARANTINE_DIR.resolve()
+
+        for p in deleting_projects:
+            project_dir = settings.STORAGE_DIR / p.id
+            if project_dir.exists():
+                # Pasta original ainda existe intacta no storage
+                p.status = "active"
+                continue
+
+            # Verificar se há pasta deste projeto em quarentena
+            found_in_quarantine = None
+            if quarantine_dir.exists():
+                for item in quarantine_dir.iterdir():
+                    if item.is_dir() and item.name.startswith(f"{p.id}_"):
+                        found_in_quarantine = item
+                        break
+
+            if found_in_quarantine and found_in_quarantine.exists():
+                # Restaurar a pasta da quarentena de volta ao storage do projeto
+                try:
+                    shutil.move(str(found_in_quarantine), str(project_dir))
+                    p.status = "active"
+                except Exception:
+                    # Se falhar a restauração física, mantém 'deleting' para intervenção
+                    pass
+            else:
+                # Diretório já não existe em lugar nenhum; finaliza limpeza no SQLite
+                db.query(JobModel).filter(JobModel.project_id == p.id).delete()
+                db.delete(p)
+
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+    # Limpar pastas da quarentena que não estejam vinculadas a projetos em recuperação
     try:
         quarantine_dir = settings.QUARANTINE_DIR.resolve()
         if quarantine_dir.exists():
@@ -26,24 +69,6 @@ def reconcile_storage_and_quarantine():
                     pass
     except Exception:
         pass
-
-    # Reconciliação no banco: se houver projeto marcado como 'deleting' cujo diretório já não existe ou está inconsistente
-    db = SessionLocal()
-    try:
-        deleting_projects = db.query(ProjectModel).filter(ProjectModel.status == "deleting").all()
-        for p in deleting_projects:
-            project_dir = settings.STORAGE_DIR / p.id
-            if not project_dir.exists():
-                # Já foi movido para quarentena e apagado, finaliza remoção no banco
-                db.delete(p)
-            else:
-                # Diretório ainda existe intacto, restaura para active
-                p.status = "active"
-        db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

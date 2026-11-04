@@ -72,11 +72,12 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
 def delete_project(project_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Exclusão recuperável em duas fases com quarentena (STORE-001 / R1):
-    1. Marca projeto como 'deleting' no banco para bloquear jobs e acessos concorrentes.
-    2. Move a pasta física para storage/.quarantine/{id}_{timestamp} atomicamente.
-    3. Remove os registros do banco SQLite e faz commit.
+    1. Verifica e cancela quaisquer jobs ativos antes de iniciar a exclusão.
+    2. Marca projeto como 'deleting' no banco para bloquear novos jobs e acessos concorrentes.
+    3. Move a pasta física para storage/.quarantine/{id}_{timestamp} atomicamente.
+    4. Remove os registros do banco SQLite e faz commit.
        - Se commit falhar: restaura pasta da quarentena e reverte status para 'active'.
-    4. Remove a pasta da quarentena de forma segura em background.
+    5. Remove a pasta da quarentena de forma segura em background.
     """
     project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
     if not project:
@@ -84,6 +85,17 @@ def delete_project(project_id: str, background_tasks: BackgroundTasks, db: Sessi
 
     if project.status == "deleting":
         raise HTTPException(status_code=409, detail="Projeto já está em processo de exclusão")
+
+    # Cancelar quaisquer jobs ativos do projeto antes da exclusão
+    active_jobs = db.query(JobModel).filter(
+        JobModel.project_id == project_id,
+        JobModel.status.in_([JobStatus.PENDING.value, JobStatus.PREPARING.value, JobStatus.RUNNING.value])
+    ).all()
+    for active_job in active_jobs:
+        try:
+            JobOrchestrator.cancel_job(active_job.id)
+        except Exception:
+            pass
 
     # Passo 1: Marcação de status no banco para bloqueio
     project.status = "deleting"
@@ -95,7 +107,7 @@ def delete_project(project_id: str, background_tasks: BackgroundTasks, db: Sessi
 
     # Proteção de segurança: diretório DEVE ser estritamente filho de STORAGE_DIR
     try:
-        if os.path.commonpath([str(storage_root), str(project_dir)]) != str(storage_root):
+        if os.path.commonpath([str(storage_root), str(project_dir)]) != str(storage_root) or project_dir == storage_root:
             project.status = "active"
             db.commit()
             raise HTTPException(status_code=403, detail="Caminho de projeto inválido ou fora do armazenamento autorizado")
