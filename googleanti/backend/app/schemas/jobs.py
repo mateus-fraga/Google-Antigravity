@@ -47,6 +47,7 @@ class ProjectResponse(BaseModel):
     category: str
     purpose: str
     strategy: str
+    status: str = "active"
     created_at: datetime
     updated_at: datetime
     active_model_path: Optional[str] = None

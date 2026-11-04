@@ -9,6 +9,7 @@ class Settings(BaseModel):
     
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
     STORAGE_DIR: Path = BASE_DIR / "projects"
+    QUARANTINE_DIR: Path = STORAGE_DIR / ".quarantine"
     MODELS_DIR: Path = BASE_DIR / "models"
     DATABASE_URL: str = f"sqlite:///{BASE_DIR}/ai_3d_studio.db"
     
@@ -23,4 +24,5 @@ class Settings(BaseModel):
 
 settings = Settings()
 settings.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+settings.QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
 settings.MODELS_DIR.mkdir(parents=True, exist_ok=True)

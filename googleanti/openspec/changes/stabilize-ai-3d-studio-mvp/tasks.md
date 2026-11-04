@@ -2,10 +2,10 @@
 
 ## 1. Segurança de Arquivos e Armazenamento Transacional (R1, R4 / SEC-001, STORE-001)
 
-- [ ] 1.1 Substituir rota `/files/download` por endpoint contextual seguro `/api/v1/projects/{project_id}/artifacts/{filename}` com sanitização de nome base, verificação estrita via `os.path.commonpath`, rejeição de symlinks e validação de registro na lista de artefatos do projeto
-- [ ] 1.2 Implementar protocolo de exclusão recuperável em duas fases para `DELETE /projects/{id}`: marcação do projeto como `DELETING`, isolamento físico atômico da pasta do projeto em quarentena (`storage/.quarantine/`), commit SQLite e remoção assíncrona da quarentena
-- [ ] 1.3 Implementar rotina de inicialização no lifespan do FastAPI para reconciliação automática de pastas órfãs deixadas em quarentena por reinicialização
-- [ ] 1.4 Criar suite de testes de segurança e persistência em `backend/tests/test_security.py` cobrindo tentativas de path traversal (`../`, caminhos absolutos, caracteres ilegais), symlinks, acesso cruzado entre projetos e reversão em falha de exclusão
+- [x] 1.1 Substituir rota `/files/download` por endpoint contextual seguro `/api/v1/projects/{project_id}/artifacts/{filename}` com sanitização de nome base, verificação estrita via `os.path.commonpath`, rejeição de symlinks e validação de registro na lista de artefatos do projeto
+- [x] 1.2 Implementar protocolo de exclusão recuperável em duas fases para `DELETE /projects/{id}`: marcação do projeto como `DELETING`, isolamento físico atômico da pasta do projeto em quarentena (`storage/.quarantine/`), commit SQLite e remoção assíncrona da quarentena
+- [x] 1.3 Implementar rotina de inicialização no lifespan do FastAPI para reconciliação automática de pastas órfãs deixadas em quarentena por reinicialização
+- [x] 1.4 Criar suite de testes de segurança e persistência em `backend/tests/test_security.py` cobrindo tentativas de path traversal (`../`, caminhos absolutos, caracteres ilegais), symlinks, acesso cruzado entre projetos e reversão em falha de exclusão
 
 ## 2. Orquestração, Não-Bloqueio e Cancelamento Efetivo (R2 / ASYNC-001)
 
