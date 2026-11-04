@@ -3,11 +3,15 @@
 ## ADDED Requirements
 
 ### Requirement: Alinhamento Estrito com Convenção Y-up
-The system SHALL gerar todas as primitivas e geometrias paramétricas alinhadas à convenção universal glTF 2.0 / WebGL com o eixo **Y** orientado verticalmente para cima, assentando a base de cada objeto no plano XZ em $Y = 0$ e distribuindo as dimensões de largura em X e profundidade em Z.
+The system SHALL gerar primitivas e geometrias alinhadas à convenção glTF 2.0 / WebGL com eixo **Y** orientado para cima, assentando a base do objeto no plano XZ em $Y = 0$, com normais voltadas para o exterior e orientação anti-horária de faces, preservando leitura de modelos legados via metadados.
 
 #### Scenario: Geração de primitiva com base no plano XZ
 - **WHEN** uma caixa, cilindro, engrenagem ou mesa é gerada com altura $H$
 - **THEN** a coordenada mínima em Y da malha resultante é $0.0$ e a coordenada máxima em Y é igual a $H$, com normais orientadas corretamente para o exterior
+
+#### Scenario: Leitura de modelo de projeto legado
+- **WHEN** um projeto anterior sem flag Y-up é carregado
+- **THEN** o sistema lê os metadados de orientação legada e preserva a geometria original sem inversões espaciais acidentais
 
 ### Requirement: Validação Rigorosa de Parâmetros e Bounds Finitos
 The system SHALL validar rigorosamente todos os parâmetros de entrada procedurais antes da geração geométrica, rejeitando valores negativos, nulos, infinitos ou NaN, impondo limites mínimos e máximos documentados e assegurando que malhas degeneradas não sejam geradas.

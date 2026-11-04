@@ -2,16 +2,28 @@
 
 ## ADDED Requirements
 
-### Requirement: Exclusão Atômica e Limpeza de Disco
-The system SHALL realizar a exclusão atômica dos registros do projeto no banco de dados e remover fisicamente o diretório correspondente em `projects/{project_id}` de forma segura e síncrona com rollback em falha de transação, garantindo que nenhum arquivo órfão permaneça no disco e proibindo terminantemente a remoção de caminhos fora do diretório de armazenamento local configurado.
+### Requirement: Exclusão Recuperável de Projetos e Isolamento de Quarentena
+The system SHALL executar a exclusão de projetos através de protocolo em duas fases com quarentena (`storage/.quarantine/`), marcando o projeto como `DELETING` no SQLite para bloquear novas tarefas, movendo o diretório físico para quarentena antes do commit e descartando a quarentena após o sucesso da transação, com suporte a reconciliação pós-reboot e proibição de remoção fora de `STORAGE_DIR`.
 
-#### Scenario: Exclusão completa de projeto
-- **WHEN** uma requisição de exclusão de projeto válida é processada
-- **THEN** os metadados do projeto, as tarefas vinculadas e todo o diretório de arquivos físicos associados ao projeto são completamente removidos do disco
+#### Scenario: Exclusão de projeto com sucesso em duas fases
+- **WHEN** uma requisição `DELETE /api/v1/projects/{project_id}` é processada
+- **THEN** o projeto é marcado como em exclusão, seus arquivos são movidos para quarentena, o registro é removido do SQLite e a quarentena é descartada de forma limpa
+
+#### Scenario: Falha transacional antes do commit no banco
+- **WHEN** ocorre uma falha no banco de dados durante a transação de exclusão
+- **THEN** a operação de banco sofre rollback, a pasta em quarentena é restaurada para a pasta original do projeto e o projeto volta ao estado ativo sem perda de dados
+
+#### Scenario: Interrupção do servidor com arquivos em quarentena
+- **WHEN** o servidor reinicia e detecta pastas órfãs no diretório de quarentena
+- **THEN** o sistema reconcilia os diretórios pendentes de forma segura garantindo consistência com a base de dados
 
 ### Requirement: Download Seguro Contextual de Artefatos
-The system SHALL fornecer download de arquivos exclusivamente através de rota contextual associada ao projeto (`/api/v1/projects/{project_id}/artifacts/{filename}`), validando estritamente que o arquivo solicitado existe dentro da pasta do projeto e rejeitando sequências de escape de caminho (`../`), caminhos absolutos, caracteres de controle ou solicitações para arquivos internos do sistema.
+The system SHALL fornecer download de arquivos exclusivamente via rota `/api/v1/projects/{project_id}/artifacts/{filename}`, validando que o caminho resolve dentro da pasta do projeto via `os.path.commonpath`, rejeitando symlinks, validando nome alfanumérico seguro (`^[a-zA-Z0-9_\-\.]+$`) e confirmando que o artefato consta na lista de arquivos registrados do projeto.
 
 #### Scenario: Tentativa de download malicioso com path traversal
 - **WHEN** um cliente solicita download contendo sequências `..` ou caminhos absolutos
 - **THEN** o sistema rejeita a solicitação com código HTTP 400 ou 403 e impede o acesso a arquivos do sistema
+
+#### Scenario: Tentativa de download via symlink ou arquivo não registrado
+- **WHEN** um cliente solicita download de um symlink ou arquivo não pertencente aos artefatos registrados do projeto
+- **THEN** o sistema rejeita a solicitação com código HTTP 403 ou 404
