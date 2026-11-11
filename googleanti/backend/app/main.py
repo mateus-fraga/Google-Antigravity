@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.config import settings
 from backend.app.storage.database import init_db, SessionLocal, ProjectModel, JobModel
+from backend.app.schemas.jobs import JobStatus
+from backend.app.jobs.orchestrator import JobOrchestrator
 from backend.app.api.routes import (
     router as api_router,
     QUARANTINE_FOLDER_REGEX,
@@ -237,13 +239,87 @@ def reconcile_storage_and_quarantine():
     except Exception as e:
         logger.error(f"Erro na rotina de varredura secundária de quarentena: {e}")
 
+def reconcile_interrupted_jobs():
+    """
+    Reconciliação determinística e idempotente de tarefas órfãs na inicialização (Task 2.3 / R2 / ASYNC-001):
+    - Inspeciona a tabela `jobs` no SQLite em busca de registros em estados não-terminais
+      (`Pendente`, `Preparando`, `Em Execução`).
+    - Transita cada tarefa interrompida para o estado terminal `Cancelada` (`JobStatus.CANCELLED.value`),
+      preenche `completed_at` com timestamp UTC, registra justificativa explícita em `error_message`
+      e adiciona metadado de auditoria (`reconciled_on_startup: True`, `interrupted_from_status`).
+    - Limpa exclusivamente arquivos temporários parciais (`.tmp.*` / `.tmp`) nos diretórios dos projetos,
+      preservando integralmente todos os artefatos válidos de jobs já concluídos.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    non_terminal_statuses = [
+        JobStatus.PENDING.value,
+        JobStatus.PREPARING.value,
+        JobStatus.RUNNING.value
+    ]
+
+    db = SessionLocal()
+    affected_projects: set[str] = set()
+    try:
+        interrupted_jobs = db.query(JobModel).filter(
+            JobModel.status.in_(non_terminal_statuses)
+        ).all()
+
+        now = datetime.now(timezone.utc)
+        for job in interrupted_jobs:
+            prev_status = job.status
+            job.status = JobStatus.CANCELLED.value
+            if not job.completed_at:
+                job.completed_at = now
+            job.error_message = (
+                f"Tarefa interrompida por reinicialização do servidor (estado anterior: {prev_status})."
+            )
+            try:
+                meta = json.loads(job.metadata_json or "{}")
+                if not isinstance(meta, dict):
+                    meta = {}
+            except Exception:
+                meta = {}
+            meta["reconciled_on_startup"] = True
+            meta["interrupted_from_status"] = prev_status
+            meta["reconciled_at"] = now.isoformat()
+            job.metadata_json = json.dumps(meta)
+            affected_projects.add(job.project_id)
+
+        if interrupted_jobs:
+            db.commit()
+            logger.info(
+                f"Reconciliação de jobs: {len(interrupted_jobs)} tarefa(s) interrompida(s) "
+                "transitada(s) para 'Cancelada'."
+            )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erro ao reconciliar tarefas interrompidas na inicialização: {e}")
+    finally:
+        db.close()
+
+    # Limpar quaisquer arquivos temporários parciais (.tmp.*) nos projetos afetados ou em STORAGE_DIR
+    try:
+        storage_root = settings.STORAGE_DIR.resolve()
+        if storage_root.exists() and storage_root.is_dir():
+            for proj_dir in storage_root.iterdir():
+                if proj_dir.is_dir() and proj_dir.name != settings.QUARANTINE_DIR.name:
+                    JobOrchestrator._cleanup_partial_files(proj_dir.name)
+    except Exception as clean_err:
+        logger.warning(f"Erro ao limpar arquivos temporários parciais na reconciliação de jobs: {clean_err}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Inicialização do banco e tabelas
     init_db()
-    # Reconciliação de arquivos e armazenamento
+    # Reconciliação de arquivos e armazenamento (Bloco 1)
     reconcile_storage_and_quarantine()
+    # Reconciliação de tarefas interrompidas por reinício do servidor (Bloco 2 - Task 2.3)
+    reconcile_interrupted_jobs()
     yield
+    # Encerramento limpo e cooperativo de jobs em execução no shutdown (Bloco 2 - Task 2.1)
+    await JobOrchestrator.shutdown_active_jobs()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

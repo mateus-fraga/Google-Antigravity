@@ -9,10 +9,10 @@
 
 ## 2. Orquestração, Não-Bloqueio e Cancelamento Efetivo (R2 / ASYNC-001)
 
-- [ ] 2.1 Refatorar `JobOrchestrator` para descarregar rotinas intensivas de geometria (`ProceduralGenerator` e `ModelExporter`) para worker threads via `asyncio.to_thread`, limitadas por semáforo de concorrência (`asyncio.Semaphore(max_workers=2)`)
-- [ ] 2.2 Implementar cancelamento cooperativo com `threading.Event` integrado aos pontos de controle do pipeline procedural e descarte imediato de arquivos parciais/temporários gerados
-- [ ] 2.3 Implementar rotina de reconciliação no lifespan do FastAPI em `backend/app/main.py` para transitar tarefas não-terminais (`Pendente`, `Preparando`, `Em Execução`) para `Cancelada` no reinício do servidor
-- [ ] 2.4 Criar suite de testes de concorrência e recuperação em `backend/tests/test_recovery.py` validando não-bloqueio de requisições HTTP durante jobs pesados, cancelamento efetivo e recuperação pós-reboot
+- [x] 2.1 Refatorar `JobOrchestrator` para descarregar rotinas intensivas de geometria (`ProceduralGenerator` e `ModelExporter`) para worker threads via `asyncio.to_thread`, limitadas por semáforo de concorrência (`asyncio.Semaphore(max_workers=2)`)
+- [x] 2.2 Implementar cancelamento cooperativo com `threading.Event` integrado aos pontos de controle do pipeline procedural e descarte imediato de arquivos parciais/temporários gerados
+- [x] 2.3 Implementar rotina de reconciliação no lifespan do FastAPI em `backend/app/main.py` para transitar tarefas não-terminais (`Pendente`, `Preparando`, `Em Execução`) para `Cancelada` no reinício do servidor
+- [x] 2.4 Criar suite de testes de concorrência e recuperação em `backend/tests/test_recovery.py` validando não-bloqueio de requisições HTTP durante jobs pesados, cancelamento efetivo e recuperação pós-reboot
 
 ## 3. Validação Paramétrica, Alinhamento Y-up e Compatibilidade (R3 / GEO-001)
 

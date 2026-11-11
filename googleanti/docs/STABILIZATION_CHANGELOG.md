@@ -504,3 +504,99 @@ Resultados dos comandos executados:
 1. **Modificação In-Place do Mesmo Inode Concorrente:** A transmissão via descritor aberto (`_open_verified_regular_file` + `_stream_from_verified_fd`) elimina completamente ataques de troca de caminho/rename/symlink (TOCTOU) após a abertura. Caso um processo local com permissão de escrita modifique os blocos do **mesmo inode** in-place durante a leitura sem trocar o arquivo, o sistema operacional reflete o conteúdo do inode; no AI 3D Studio, todas as exportações de modelos utilizam escrita em arquivo temporário seguida de substituição (`os.replace`), não sobrescrevendo artefatos in-place.
 2. **Ausência de `O_NOFOLLOW` e `fsync` de Diretório na CRT do Windows:** O Windows não define `os.O_NOFOLLOW` nem permite `os.fsync()` em descritores de diretório abertos via CRT; a mitigação implementada realiza dupla checagem (`lstat` + cadeia de symlinks/junctions antes e depois de `os.open`, validando igualdade de `st_ino` e `st_dev` com `os.fstat(fd)`).
 3. **Preservação de Pastas com Manifesto Inválido:** Qualquer pasta em `storage/.quarantine/` cujo manifesto seja inválido, incompleto ou divergente é preservada em disco até inspeção manual, evitando perda acidental de dados.
+
+
+---
+
+## Entrada 6: Implementação e Validação do Bloco 2 — Orquestração, Não-Bloqueio e Cancelamento Efetivo
+
+### Identificação
+- **Projeto:** AI 3D Studio
+- **Mudança OpenSpec:** `stabilize-ai-3d-studio-mvp`
+- **Branch Git:** `testes`
+- **Data da Execução:** 2026-11-09
+- **Bloco e Tarefas:** Bloco 2 — Orquestração, Não-Bloqueio e Cancelamento Efetivo (Tarefas 2.1, 2.2, 2.3, 2.4)
+- **Documento Diretor:** `AI_3D_Studio_OpenSpec_Bloco_2_Antigravity.md`
+
+---
+
+### 1. Diagnóstico Inicial do Pipeline de Execução e Cancelamento
+
+1. **Execução CPU-Bound Síncrona no Event Loop:**
+   - Anteriormente, `JobOrchestrator.run_procedural_job_async` executava `ProceduralGenerator.generate_by_params()`, `ProceduralGenerator.inspect_mesh()` e `ModelExporter.export_and_validate()` diretamente na coroutine principal do FastAPI, bloqueando o event loop durante operações geométricas (Trimesh/Shapely) e de I/O de disco.
+   - Não existia limite de concorrência (`asyncio.Semaphore`), permitindo sobrecarga de CPU caso múltiplos jobs fossem disparados simultaneamente.
+2. **Cancelamento Não-Cooperativo e Sobrescrita de Estados:**
+   - `JobOrchestrator.cancel_job()` chamava `task.cancel()` e imediatamente sobrescrevia o status no SQLite para `Cancelada` sem verificar se o job já havia terminado (`Concluída` ou `Falhou`), violando a idempotência para tarefas já concluídas.
+   - Além disso, caso uma thread estivesse executando código síncrono ou o projeto fosse excluído (`DELETE /projects/{id}`) enquanto uma geração ocorria, a rotina síncrona não possuía pontos de verificação (`threading.Event`) e podia recriar `STORAGE_DIR/{project_id}` após a pasta ter sido movida para quarentena no Bloco 1.
+   - `ModelExporter.export_and_validate()` escrevia diretamente no caminho final `.glb`, podendo deixar arquivos parciais/incompletos no diretório do projeto caso interrompido.
+3. **Ausência de Reconciliação de Jobs Órfãos no Startup:**
+   - Se o servidor reiniciasse enquanto jobs estavam em `Pendente`, `Preparando` ou `Em Execução`, esses registros permaneciam indefinidamente travados em estados não-terminais no SQLite.
+
+---
+
+### 2. Alterações Arquiteturais e Técnicas Implementadas (Tarefas 2.1 a 2.4)
+
+#### Tarefa 2.1 — Isolamento em Worker Threads e Controle de Concorrência (`backend/app/jobs/orchestrator.py`, `backend/app/main.py`)
+- Implementado isolamento de todas as rotinas CPU-bound e de I/O de malha em `_execute_procedural_pipeline_sync()`, invocada fora do event loop principal via `asyncio.to_thread(...)`.
+- Adicionado controle explícito de concorrência via `asyncio.Semaphore(cls.MAX_CONCURRENT_JOBS)` com `MAX_CONCURRENT_JOBS = 2` (vinculado dinamicamente ao event loop ativo em `_get_semaphore()`).
+- Adicionado `JobOrchestrator.shutdown_active_jobs()` no encerramento do `lifespan` do FastAPI em `backend/app/main.py`, sinalizando cancelamento cooperativo e aguardando o término limpo das tasks ativas sem deixar threads/tasks órfãs.
+
+#### Tarefa 2.2 — Cancelamento Cooperativo, Escrita Atômica e Limpeza de Temporários (`backend/app/jobs/orchestrator.py`, `backend/app/exporters/mesh_exporter.py`)
+- Associado um `threading.Event` (`_cancellation_events[job_id]`) a cada job ativo, protegido por `threading.Lock` (`_state_lock`).
+- Diferenciação explícita entre **pedido de cancelamento** (`metadata["cancel_requested"] = True` e `cancel_requested_at` registrados no momento da solicitação + disparo do `threading.Event`) e **reconhecimento/conclusão do cancelamento** (`cancel_acknowledged: True` e transição segura para `JobStatus.CANCELLED` com `completed_at` preenchido).
+- Idempotência estrita em `update_job_status()` e `cancel_job()`:
+  - Se uma tarefa já atingiu o estado `Concluída` (ou `Falhou`), chamadas subsequentes a `cancel_job()` retornam `False` e **preservam integralmente** o estado `Concluída`, seu histórico e seus artefatos registrados.
+  - Se uma tarefa foi cancelada ou seu projeto entrou em status `'deleting'` (integração com Bloco 1), a worker thread detecta imediatamente nos checkpoints cooperativos:
+    - Checkpoint 1: Antes de `ProceduralGenerator.generate_by_params()`.
+    - Checkpoint 2: Após geração da malha e antes de `ProceduralGenerator.inspect_mesh()`.
+    - Checkpoint 3: Antes e durante `ModelExporter.export_and_validate()` (antes da serialização, antes da gravação em `.tmp`, antes da validação Trimesh e antes do `os.replace` final).
+    - Checkpoint 4: Antes de atualizar `ProjectModel.active_model_path` e transitar o job para `Concluída`.
+- Refatorado `ModelExporter.export_and_validate()` para gravar primeiramente em arquivo oculto temporário `.{stem}_{hex}.tmp.{fmt}` com `flush()` + `os.fsync()`, validar tamanho e reimportação no Trimesh a partir do temporário e promover atomicamente via `os.replace()` apenas se não houver cancelamento. Em caso de erro ou cancelamento, `_cleanup_partial_files()` remove imediatamente os temporários parciais sem jamais tocar em artefatos válidos anteriores.
+
+#### Tarefa 2.3 — Reconciliação Determinística de Jobs Interrompidos no Startup (`backend/app/main.py`)
+- Implementada `reconcile_interrupted_jobs()` e integrada ao `lifespan` do FastAPI logo após `reconcile_storage_and_quarantine()`.
+- Política determinística conforme especificação OpenSpec (`specs/job-orchestration/spec.md` e `tasks.md` 2.3):
+  - Qualquer tarefa encontrada em estado não-terminal (`Pendente`, `Preparando`, `Em Execução`) no startup é transitada para `Cancelada` (`JobStatus.CANCELLED.value`), recebendo `completed_at` em UTC, mensagem explícita (`"Tarefa interrompida por reinicialização do servidor (estado anterior: ...)"`) e metadados `{"reconciled_on_startup": True, "interrupted_from_status": ..., "reconciled_at": ...}`.
+  - Remove arquivos temporários órfãos (`.tmp.*` / `.tmp`) nos diretórios de projetos, preservando todos os modelos `.glb`/`.obj`/`.stl` válidos de tarefas concluídas.
+
+#### Tarefa 2.4 — Suíte de Testes Determinísticos de Concorrência e Recuperação (`backend/tests/test_recovery.py`)
+- Criado `backend/tests/test_recovery.py` utilizando fixture isolada em `tmp_path` (`isolated_recovery_env`) e sincronização determinística por barreiras (`threading.Event`), sem depender de sleeps arbitrários:
+  1. `test_event_loop_non_blocking_during_heavy_cpu_job`: comprova que a geração roda em thread separada da thread do event loop e que coroutines concorrentes respondem imediatamente enquanto a worker thread está retida.
+  2. `test_concurrency_semaphore_limits_active_workers_to_max`: dispara 4 jobs simultâneos e comprova que exatamente 2 executam em paralelo (`MAX_CONCURRENT_JOBS = 2`) enquanto os outros 2 aguardam como `Pendente` até a liberação do semáforo.
+  3. `test_cooperative_cancellation_during_generation_and_export_cleans_partials`: testa cancelamento durante `generate_by_params` e durante `ModelExporter.export_and_validate`, comprovando limpeza de `.tmp.glb`, ausência de publicação de resultados incompletos e preservação do modelo válido anterior do projeto.
+  4. `test_cancel_already_completed_job_is_idempotent_and_preserves_completed`: comprova que cancelar um job já `Concluída` mantém seu status `Concluída` e seus artefatos intactos.
+  5. `test_reconcile_interrupted_jobs_on_startup_and_preserve_completed_artifacts`: comprova que tarefas em `Pendente`, `Preparando` e `Em Execução` transitam para `Cancelada` no startup, arquivos `.tmp.glb` órfãos são limpos e tarefas `Concluída` e seus artefatos permanecem intactos mesmo após múltiplas execuções.
+  6. `test_project_deletion_while_job_running_in_threadpool_prevents_resurrection`: comprova a integração entre o Bloco 1 e o Bloco 2 — excluir um projeto enquanto uma worker thread está rodando cancela cooperativamente o job e impede que a worker thread recrie a pasta `STORAGE_DIR/{project_id}` após a exclusão.
+
+---
+
+### 3. Arquivos Locais Modificados / Criados
+1. `backend/app/jobs/orchestrator.py` (modificado)
+2. `backend/app/exporters/mesh_exporter.py` (modificado)
+3. `backend/app/main.py` (modificado)
+4. `backend/tests/test_recovery.py` (novo)
+5. `openspec/changes/stabilize-ai-3d-studio-mvp/tasks.md` (atualizado status das tarefas 2.1 a 2.4 para `[x]`)
+6. `docs/STABILIZATION_CHANGELOG.md` (atualizado cumulativamente)
+
+---
+
+### 4. Resultados Reais dos Testes, Build e Validação OpenSpec
+
+1. **Testes de Concorrência e Recuperação do Bloco 2:**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests\test_recovery.py -vv`
+   - Resultado: **6 aprovados, 0 falhas, 1 aviso** (`StarletteDeprecationWarning`) em `3.05s`.
+2. **Suíte Completa do Backend (Regressão Bloco 1 + Bloco 2 + Legado):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests -v`
+   - Resultado: **40 aprovados, 0 falhas, 1 aviso** em `4.54s` (incluindo os 18 testes de segurança do Bloco 1 e os 6 testes de concorrência/recuperação do Bloco 2).
+3. **Build de Produção do Frontend:**
+   - Comando: `cd frontend && npm run build`
+   - Resultado: **Sucesso (`✓ built in 1.05s`)**, `0` erros TypeScript (`tsc -b && vite build`), `1` aviso informativo do Vite sobre tamanho de chunk (> 500 kB).
+4. **Validação Estrita OpenSpec:**
+   - Comando: `openspec validate --strict stabilize-ai-3d-studio-mvp`
+   - Resultado: **`Change 'stabilize-ai-3d-studio-mvp' is valid`** (`0` erros, `0` avisos).
+
+---
+
+### 5. Riscos Residuais e Limitações Conhecidas
+1. **Granularidade dos Checkpoints Cooperativos em Chamadas C/C++ Nativas:** Como Python não permite matar preemptivamente uma worker thread sem corromper o interpretador, se uma única chamada atômica de biblioteca nativa (ex: booleana complexa no Shapely/Trimesh) levar alguns milissegundos, o cancelamento cooperativo aguarda o retorno imediato daquela função para abortar no checkpoint seguinte e descartar temporários.
+2. **Escopo dos Próximos Blocos:** A validação estrita de parâmetros finitos e orientação geométrica Y-up pertencem ao **Bloco 3 (Tarefas 3.1 a 3.4)**; o descarte WebGL e o botão de cancelamento na interface React pertencem ao **Bloco 4 (Tarefas 4.1 a 4.4)**. Nenhum desses blocos foi iniciado.
