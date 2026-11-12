@@ -18,6 +18,7 @@ class ProjectModel(Base):
     category = Column(String, default="mechanical")
     purpose = Column(String, default="general")
     strategy = Column(String, default="procedural")
+    status = Column(String, default="active", nullable=False)  # "active" ou "deleting"
     created_at = Column(DateTime(timezone=True), default=get_utc_now)
     updated_at = Column(DateTime(timezone=True), default=get_utc_now, onupdate=get_utc_now)
     active_model_path = Column(String, nullable=True)
@@ -48,6 +49,15 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # Migração leve para garantir a coluna status na tabela projects caso o banco SQLite já exista
+    with engine.connect() as conn:
+        try:
+            from sqlalchemy import text
+            conn.execute(text("ALTER TABLE projects ADD COLUMN status VARCHAR DEFAULT 'active'"))
+            conn.commit()
+        except Exception:
+            # Coluna já existe
+            pass
 
 def get_db():
     db = SessionLocal()
