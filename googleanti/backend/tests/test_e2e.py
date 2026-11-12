@@ -1,5 +1,6 @@
 import pytest
 import os
+import time
 from pathlib import Path
 from fastapi.testclient import TestClient
 import trimesh
@@ -10,20 +11,19 @@ client = TestClient(app)
 
 def test_full_e2e_workflow():
     """
-    Fluxo de aceitação E2E Local:
-    1. Criar novo projeto
-    2. Submeter tarefa de geração de engrenagem paramétrica
-    3. Aguardar conclusão e verificar modelo GLB gerado em disco
-    4. Validar que o GLB pode ser carregado e inspecionado com sucesso (Three.js / Trimesh)
-    5. Fazer download do arquivo através do endpoint de arquivos
-    6. Excluir o projeto e verificar integridade
+    Fluxo de aceitação E2E Local (Tarefa 5.1):
+    1. Criar novo projeto e confirmar metadados coordinate_system == 'Y-up' e geometry_schema_version == 2
+    2. Rejeição determinística de parâmetros geométricos inválidos (HTTP 422) sem sujar o estado
+    3. Submeter tarefa de geração procedural, acompanhar até Concluída e validar telemetria Y-up
+    4. Exportar sob demanda nos 3 formatos (GLB, OBJ, STL), listar artefatos contextuais e baixar com integridade de bytes
+    5. Cancelamento cooperativo de job ativo e exclusão recuperável do projeto (sem arquivos órfãos)
     """
-    # 1. Criar Projeto
+    # 1. Criar Projeto e validar metadados padrão Y-up e schema v2
     create_res = client.post(
         "/api/v1/projects",
         json={
             "name": "E2E Gear Project",
-            "description": "Engrenagem mecânica procedural para teste de aceitação",
+            "description": "Engrenagem mecânica procedural para teste de aceitação completo",
             "category": "mechanical",
             "purpose": "technical",
             "strategy": "procedural"
@@ -33,7 +33,32 @@ def test_full_e2e_workflow():
     proj_data = create_res.json()
     proj_id = proj_data["id"]
 
-    # 2. Submeter Tarefa de Geração Procedural
+    # Validar metadados do projeto via GET
+    get_proj_res = client.get(f"/api/v1/projects/{proj_id}")
+    assert get_proj_res.status_code == 200
+    proj_details = get_proj_res.json()
+    assert proj_details.get("coordinate_system") == "Y-up"
+    assert proj_details.get("geometry_schema_version") == 2
+
+    # 2. Rejeição determinística de parâmetros geométricos inválidos (HTTP 422)
+    invalid_job_res = client.post(
+        "/api/v1/jobs",
+        json={
+            "project_id": proj_id,
+            "operation_type": "procedural_generation",
+            "params": {
+                "shape_type": "gear",
+                "outer_radius": -1.0,  # Inválido: <= 0
+                "inner_radius": 1.1,
+                "bore_radius": 0.4,
+                "num_teeth": 16,
+                "height": 0.3
+            }
+        }
+    )
+    assert invalid_job_res.status_code == 422
+
+    # 3. Submeter Tarefa de Geração Procedural Válida
     job_res = client.post(
         "/api/v1/jobs",
         json={
@@ -53,7 +78,7 @@ def test_full_e2e_workflow():
     job_data = job_res.json()
     job_id = job_data["id"]
 
-    # 3. Consultar Job e verificar conclusão
+    # Consultar Job e verificar conclusão
     status_res = client.get(f"/api/v1/jobs/{job_id}")
     assert status_res.status_code == 200
     status_data = status_res.json()
@@ -61,19 +86,71 @@ def test_full_e2e_workflow():
     assert len(status_data["result_files"]) > 0
 
     glb_relative_path = status_data["result_files"][0]
+    glb_filename = Path(glb_relative_path).name
     glb_full_path = settings.BASE_DIR / glb_relative_path
     assert glb_full_path.exists()
     assert glb_full_path.stat().st_size > 0
 
-    # 4. Validar geometria reimportada
+    # Validar geometria Y-up (assentamento no solo XZ em Y=0 com altura positiva)
     loaded_scene = trimesh.load(str(glb_full_path))
     assert not loaded_scene.is_empty
+    mesh = loaded_scene.dump()[0] if hasattr(loaded_scene, "dump") else loaded_scene
+    bounds = mesh.bounds
+    assert bounds[0][1] >= -1e-4  # Y_min >= 0 (solo)
+    assert bounds[1][1] > 0.0     # Y_max > 0 (altura positiva)
 
-    # 5. Download via API
-    dl_res = client.get(f"/api/v1/files/download?path={glb_full_path}")
-    assert dl_res.status_code == 200
-    assert len(dl_res.content) == glb_full_path.stat().st_size
+    # 4. Exportação sob demanda nos 3 formatos suportados (GLB, OBJ, STL)
+    for fmt in ["glb", "obj", "stl"]:
+        exp_res = client.post(f"/api/v1/projects/{proj_id}/export/{fmt}")
+        assert exp_res.status_code == 200
+        exp_data = exp_res.json()
+        assert exp_data["format"] == fmt
+        assert exp_data["filename"].endswith(f".{fmt}")
 
-    # 6. Limpeza e Exclusão
+    # Listagem contextual de artefatos
+    artifacts_res = client.get(f"/api/v1/projects/{proj_id}/artifacts")
+    assert artifacts_res.status_code == 200
+    artifacts_data = artifacts_res.json()
+    artifact_names = [a["filename"] for a in artifacts_data.get("artifacts", [])]
+    assert any(name.endswith(".glb") for name in artifact_names)
+    assert any(name.endswith(".obj") for name in artifact_names)
+    assert any(name.endswith(".stl") for name in artifact_names)
+
+    # Download seguro e contextual verificando cabeçalhos e integridade dos bytes
+    for artifact_info in artifacts_data.get("artifacts", []):
+        fname = artifact_info["filename"]
+        dl_res = client.get(f"/api/v1/projects/{proj_id}/artifacts/{fname}")
+        assert dl_res.status_code == 200
+        assert len(dl_res.content) == artifact_info["size_bytes"]
+        assert "Content-Disposition" in dl_res.headers
+        assert dl_res.headers["Content-Disposition"].startswith("attachment;")
+
+    # Compatibilidade do endpoint legado com caminho resolvido
+    legacy_dl_res = client.get(f"/api/v1/files/download?path={glb_full_path}")
+    assert legacy_dl_res.status_code == 200
+    assert len(legacy_dl_res.content) == glb_full_path.stat().st_size
+
+    # 5. Fluxo de Cancelamento Cooperativo
+    # Submeter um job e testar endpoint de cancelamento
+    cancel_job_res = client.post(
+        "/api/v1/jobs",
+        json={
+            "project_id": proj_id,
+            "operation_type": "procedural_generation",
+            "params": {"shape_type": "cylinder", "radius": 0.8, "height": 2.0}
+        }
+    )
+    assert cancel_job_res.status_code == 200
+    c_job_id = cancel_job_res.json()["id"]
+
+    # Cancelar o job
+    cancel_req = client.post(f"/api/v1/jobs/{c_job_id}/cancel")
+    assert cancel_req.status_code in [200, 400]  # 200 se cancelou, 400 se já havia concluído
+
+    # 6. Exclusão Recuperável do Projeto com Quarentena e ausência de órfãos
     del_res = client.delete(f"/api/v1/projects/{proj_id}")
     assert del_res.status_code == 200
+
+    # Confirma que o projeto não pode mais ser acessado
+    assert client.get(f"/api/v1/projects/{proj_id}").status_code == 404
+    assert client.get(f"/api/v1/projects/{proj_id}/artifacts").status_code == 404

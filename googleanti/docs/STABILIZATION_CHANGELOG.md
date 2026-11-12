@@ -752,3 +752,65 @@ Resultados dos comandos executados:
 
 
 
+---
+
+## Entrada 10 — Implementação e Validação do Bloco 5 — Testes E2E, Automação de Inicialização e Encerramento da Estabilização do MVP
+- **Data:** 2026-11-12
+- **Mudança OpenSpec:** `stabilize-ai-3d-studio-mvp`
+- **Branch Git:** `developing`
+- **Escopo:** Bloco 5 — Tarefas 5.1, 5.2, 5.3 e 5.4 (Conclusão de 100% das tarefas da mudança)
+- **Status:** Implementado, Testado e Concluído (`62 passed`, Linter `0` avisos e `0` erros, Frontend Build `0` erros, OpenSpec `valid`)
+
+---
+
+### 1. Diagnóstico Inicial (Pré-Implementação do Bloco 5)
+
+1. **Testes Ponta a Ponta Legados (`test_e2e.py` e `test_api.py`):**
+   - Os testes de aceitação anteriores em `backend/tests/test_e2e.py` e `backend/tests/test_api.py` ainda continham referências parciais ao endpoint legado `/api/v1/files/download?path=...` e não cobriam o ciclo de vida ponta a ponta estabilizado: verificação explícita de metadados padrão `Y-up` (`geometry_schema_version == 2`), rejeição determinística de parâmetros inválidos com HTTP 422, exportação e validação multiformato sob demanda (GLB, OBJ, STL), listagem contextual de artefatos (`/api/v1/projects/{id}/artifacts`) com download seguro e integridade de bytes, cancelamento cooperativo e quarentena recuperável na exclusão.
+2. **Automação de Inicialização Local e Compatibilidade de Execução:**
+   - Havia necessidade de garantir que desenvolvedores e avaliadores pudessem subir simultaneamente o Backend FastAPI e o Frontend Vite com um único comando sem encontrar `ModuleNotFoundError: No module named 'backend'`, configurando automaticamente `PYTHONPATH`, checando/instalando dependências (`backend/venv` e `frontend/node_modules`) e fornecendo encerramento limpo dos serviços tanto no Windows quanto em sistemas Unix/Linux.
+3. **Auditoria de Qualidade e Linter do Frontend:**
+   - O linter do frontend apresentava 2 avisos de React hooks (`exhaustive-deps` e `refs`) no `ModelViewer.tsx` e `App.tsx` que precisavam ser sanados para garantir conformidade estrita com o compilador React e padrões modernos de código limpo.
+4. **Documentação de Aceitação Visual do Three.js:**
+   - Faltava um roteiro padronizado e documentado descrevendo os critérios de aceitação visual e interativa para órbita, inspeção Y-up, vistas ortográficas/isométricas, descarte de memória GPU (`disposeHierarchy`) e exportação multiformato.
+
+---
+
+### 2. Alterações Implementadas por Tarefa e Arquivo
+
+| Tarefa | Arquivo(s) | Modificações Realizadas | Descrição Técnica |
+| :--- | :--- | :--- | :--- |
+| **5.1** | `backend/tests/test_e2e.py`, `backend/tests/test_api.py` | Atualização dos fluxos E2E e de API | Expansão de `test_full_e2e_workflow` em `test_e2e.py` para cobrir o ciclo de vida completo: (1) criação de projeto e asserção de `coordinate_system == "Y-up"` e `geometry_schema_version == 2`; (2) rejeição determinística de parâmetros geométricos inválidos com HTTP 422 sem poluir o banco; (3) geração procedural de engrenagem Y-up, validação de término e bounds ($Y_{\text{min}} \ge 0$, $Y_{\text{max}} > 0$); (4) exportação sob demanda em GLB, OBJ e STL, listagem contextual de artefatos e download com integridade de bytes e cabeçalhos `Content-Disposition`; (5) teste de cancelamento cooperativo; e (6) exclusão recuperável do projeto comprovando ausência de arquivos órfãos e retorno 404 subsequente. Alinhamento de `test_project_and_job_api_lifecycle` em `test_api.py` com o endpoint contextual seguro de artefatos. |
+| **5.2** | `execs/start_dev.bat`, `execs/start_dev.sh`, `execs/run_tests.bat`, `scripts/start_dev.bat`, `scripts/start_dev.sh`, `README.md`, `googleanti/README.md` | Criação dos inicializadores facilitadores e documentação | Criação de scripts de inicialização com verificação automática de Python 3.10+ e Node.js 18+, criação/instalação transparente de `backend/venv` e `frontend/node_modules`, inicialização coordenada do Uvicorn (`127.0.0.1:8000`) e Vite (`127.0.0.1:5173`) com `PYTHONPATH` devidamente posicionado na raiz, e encerramento seguro (`taskkill` no Windows e `trap INT TERM EXIT` no Bash). Documentação nos arquivos `README.md` explicando a inicialização com comando único. |
+| **5.3** | `frontend/src/viewer/ModelViewer.tsx`, `frontend/src/App.tsx` | Correção do linter e compilação do frontend | Eliminação dos warnings do oxlint através da sincronização de callbacks via `useEffect` seguro para `onMeshLoadedRef` e `onViewerErrorRef`, e refatoração do efeito inicial de carregamento de projetos em `App.tsx` com flag de montagem (`isMounted`). Verificação com `npm run lint` (`0` erros, `0` warnings) e `npm run build` (`0` erros TypeScript). Execução da suíte completa de 62 testes do backend com 100% de aprovação. |
+| **5.4** | `docs/VISUAL_ACCEPTANCE_TESTING.md`, `openspec/changes/stabilize-ai-3d-studio-mvp/tasks.md` | Roteiro de testes visuais e encerramento de tarefas OpenSpec | Elaboração de guia detalhado de testes de aceitação interativa no Three.js cobrindo 6 cenários essenciais: Órbita/Pan/Zoom, Eixos Y-up e Solo XZ, Câmeras Predefinidas, Troca de Modelo e Descarte WebGL (`disposeHierarchy`), Exportação Multiformato e Cancelamento de Tarefas. Atualização de todas as tarefas remanescentes (5.1 a 5.4) para `[x]` no `tasks.md`, concluindo 100% do plano de estabilização do MVP. |
+
+---
+
+### 3. Comandos Executados e Resultados Reais
+
+1. **Suíte Completa de Testes do Backend (Pytest):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend/tests --basetemp=data/pytest_tmp -v`
+   - Resultado: **62 aprovados (`62 passed`), 0 falhas, 1 aviso** (`StarletteDeprecationWarning`) em `5.89s`.
+2. **Linter do Frontend (oxlint):**
+   - Comando: `cd frontend && npm run lint`
+   - Resultado: **`0` erros e `0` avisos** (`Found 0 warnings and 0 errors. Finished in 51ms on 7 files`).
+3. **Build de Produção do Frontend (TypeScript + Vite):**
+   - Comando: `cd frontend && npm run build`
+   - Resultado: **Sucesso (`✓ built in 1.00s`)**, `0` erros de compilação TypeScript (`tsc -b && vite build`).
+4. **Validação Estrita OpenSpec:**
+   - Comando: `npx openspec validate --strict stabilize-ai-3d-studio-mvp`
+   - Resultado: **`Change 'stabilize-ai-3d-studio-mvp' is valid`** (`0` erros, `0` avisos).
+5. **Status do Repositório Git:**
+   - Branch: `developing`
+   - Modificações mantidas estritamente no ambiente local (sem operações de escrita no Git, respeitando a restrição inegociável).
+
+---
+
+### 4. Conclusão da Mudança `stabilize-ai-3d-studio-mvp`
+Com a entrega do Bloco 5, todos os 5 blocos do plano de estabilização foram integralmente implementados, auditados e cobertos por testes determinísticos:
+- **Bloco 1 (SEC-001 / STORE-001):** Download contextual seguro, exclusão atômica com quarentena e reconciliação no lifespan.
+- **Bloco 2 (ASYNC-001):** Execução não-bloqueante em worker threads, semáforo de concorrência e cancelamento cooperativo.
+- **Bloco 3 (GEO-001):** Validação estrita de parâmetros finitos, alinhamento Y-up e compatibilidade retroativa.
+- **Bloco 4 (MEM-001 / UI-001):** Descarte profundo de recursos WebGL, indicadores de eixos Y-up, exportação multiformato (GLB, OBJ, STL) e UI responsiva.
+- **Bloco 5:** Suíte ponta a ponta (E2E), scripts facilitadores de inicialização, zero warnings de linter e roteiro de aceitação visual.

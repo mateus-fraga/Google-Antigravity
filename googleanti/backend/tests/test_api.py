@@ -12,7 +12,7 @@ def test_health_check():
     assert data["local_only"] is True
 
 def test_project_and_job_api_lifecycle():
-    # 1. Criar projeto
+    # 1. Criar projeto e verificar metadados Y-up
     proj_resp = client.post(
         "/api/v1/projects",
         json={
@@ -25,6 +25,7 @@ def test_project_and_job_api_lifecycle():
     assert proj_resp.status_code == 200
     proj_data = proj_resp.json()
     proj_id = proj_data["id"]
+    assert proj_data.get("coordinate_system") == "Y-up"
 
     # 2. Listar projetos
     list_resp = client.get("/api/v1/projects")
@@ -48,7 +49,21 @@ def test_project_and_job_api_lifecycle():
     status_resp = client.get(f"/api/v1/jobs/{job_id}")
     assert status_resp.status_code == 200
     assert status_resp.json()["id"] == job_id
+    assert status_resp.json()["status"] == "Concluída"
 
-    # 5. Excluir projeto
+    # 5. Listar e validar artefatos contextuais
+    artifacts_resp = client.get(f"/api/v1/projects/{proj_id}/artifacts")
+    assert artifacts_resp.status_code == 200
+    artifacts_data = artifacts_resp.json()
+    assert len(artifacts_data.get("artifacts", [])) > 0
+    active_fname = artifacts_data["artifacts"][0]["filename"]
+
+    # 6. Download via endpoint contextual seguro
+    dl_resp = client.get(f"/api/v1/projects/{proj_id}/artifacts/{active_fname}")
+    assert dl_resp.status_code == 200
+    assert len(dl_resp.content) > 0
+    assert "Content-Disposition" in dl_resp.headers
+
+    # 7. Excluir projeto
     del_resp = client.delete(f"/api/v1/projects/{proj_id}")
     assert del_resp.status_code == 200

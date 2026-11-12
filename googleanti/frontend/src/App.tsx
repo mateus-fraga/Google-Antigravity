@@ -71,30 +71,36 @@ export function App() {
     [refreshProjectArtifacts]
   );
 
-  const loadProjects = useCallback(async () => {
-    try {
-      const list = await apiService.listProjects();
-      setProjects(list);
-      if (list.length > 0) {
-        await selectProjectAndLoadModel(list[0]);
-      } else {
-        const initial = await apiService.createProject({
-          name: 'Projeto Principal',
-          description: 'Projeto padrão do AI 3D Studio',
-          category: 'mechanical',
-        });
-        setProjects([initial]);
-        await selectProjectAndLoadModel(initial);
-      }
-    } catch (err) {
-      console.error(err);
-      setStatusMessage('Aviso: Backend local ainda não conectado ou inicializando.');
-    }
-  }, [selectProjectAndLoadModel]);
-
   useEffect(() => {
-    loadProjects();
-  }, [loadProjects]);
+    let isMounted = true;
+    (async () => {
+      try {
+        const list = await apiService.listProjects();
+        if (!isMounted) return;
+        setProjects(list);
+        if (list.length > 0) {
+          await selectProjectAndLoadModel(list[0]);
+        } else {
+          const initial = await apiService.createProject({
+            name: 'Projeto Principal',
+            description: 'Projeto padrão do AI 3D Studio',
+            category: 'mechanical',
+          });
+          if (!isMounted) return;
+          setProjects([initial]);
+          await selectProjectAndLoadModel(initial);
+        }
+      } catch (err) {
+        console.error(err);
+        if (isMounted) {
+          setStatusMessage('Aviso: Backend local ainda não conectado ou inicializando.');
+        }
+      }
+    })();
+    return () => {
+      isMounted = false;
+    };
+  }, [selectProjectAndLoadModel]);
 
   const handleCreateNewProject = async () => {
     const name = prompt('Nome do novo projeto:', `Projeto ${projects.length + 1}`);

@@ -30,7 +30,7 @@
 
 ## 5. Verificação Completa e Integração Contínua (R4, R6)
 
-- [ ] 5.1 Atualizar `backend/tests/test_api.py` e `backend/tests/test_e2e.py` para refletir as rotas contextuais seguras de artefatos e convenção Y-up
-- [ ] 5.2 Executar a suite completa de testes automatizados do backend (`pytest backend/tests -v`) garantindo 100% de aprovação sem regressões
-- [ ] 5.3 Executar build de produção do frontend (`npm run build`) validando tipos TypeScript e ausência de erros de compilação
-- [ ] 5.4 Documentar e validar o roteiro de testes de aceitação visual e interativa no navegador para o Three.js cobrindo órbita, inspeção, troca de modelo e exportação multiformato
+- [x] 5.1 Atualizar `backend/tests/test_api.py` e `backend/tests/test_e2e.py` para refletir as rotas contextuais seguras de artefatos e convenção Y-up
+- [x] 5.2 Executar a suite completa de testes automatizados do backend (`pytest backend/tests -v`) garantindo 100% de aprovação sem regressões
+- [x] 5.3 Executar build de produção do frontend (`npm run build`) validando tipos TypeScript e ausência de erros de compilação
+- [x] 5.4 Documentar e validar o roteiro de testes de aceitação visual e interativa no navegador para o Three.js cobrindo órbita, inspeção, troca de modelo e exportação multiformato

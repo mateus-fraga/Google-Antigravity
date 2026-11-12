@@ -20,15 +20,28 @@ export const ModelViewer: React.FC<ModelViewerProps> = ({
   const instanceRef = useRef<ThreeViewer | null>(null);
   const [viewerError, setViewerError] = useState<string | null>(null);
 
+  const onMeshLoadedRef = useRef(onMeshLoaded);
+  const onViewerErrorRef = useRef(onViewerError);
+
+  useEffect(() => {
+    onMeshLoadedRef.current = onMeshLoaded;
+  }, [onMeshLoaded]);
+
+  useEffect(() => {
+    onViewerErrorRef.current = onViewerError;
+  }, [onViewerError]);
+
   useEffect(() => {
     if (!containerRef.current) return;
 
     const viewer = new ThreeViewer({
       container: containerRef.current,
-      onMeshLoaded,
+      onMeshLoaded: (mesh) => {
+        if (onMeshLoadedRef.current) onMeshLoadedRef.current(mesh);
+      },
       onError: (msg) => {
         setViewerError(msg);
-        if (onViewerError) onViewerError(msg);
+        if (onViewerErrorRef.current) onViewerErrorRef.current(msg);
       },
     });
 
@@ -42,7 +55,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = ({
       instanceRef.current = null;
       if (viewerRef) viewerRef.current = null;
     };
-  }, []);
+  }, [viewerRef]);
 
   useEffect(() => {
     if (!instanceRef.current) return;
