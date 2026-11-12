@@ -58,6 +58,16 @@ class JobOrchestrator:
     _state_lock: threading.Lock = threading.Lock()
     _semaphore: Optional[asyncio.Semaphore] = None
     _semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
+    _main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    @classmethod
+    def set_main_loop(cls, loop: Optional[asyncio.AbstractEventLoop]):
+        """
+        Registra o event loop principal da aplicação FastAPI (no startup do lifespan)
+        para garantir despacho assíncrono não-bloqueante e semáforo compartilhado.
+        """
+        with cls._state_lock:
+            cls._main_loop = loop
 
     @classmethod
     def _get_semaphore(cls) -> asyncio.Semaphore:
@@ -66,10 +76,11 @@ class JobOrchestrator:
         Recria automaticamente se o event loop mudou (ex: entre testes ou reinicializações).
         """
         loop = asyncio.get_running_loop()
-        if cls._semaphore is None or cls._semaphore_loop is not loop:
-            cls._semaphore = asyncio.Semaphore(cls.MAX_CONCURRENT_JOBS)
-            cls._semaphore_loop = loop
-        return cls._semaphore
+        with cls._state_lock:
+            if cls._semaphore is None or cls._semaphore_loop is not loop:
+                cls._semaphore = asyncio.Semaphore(cls.MAX_CONCURRENT_JOBS)
+                cls._semaphore_loop = loop
+            return cls._semaphore
 
     @classmethod
     def validate_transition(cls, current: JobStatus, target: JobStatus):
@@ -127,27 +138,39 @@ class JobOrchestrator:
             db.close()
 
     @classmethod
-    def _cleanup_partial_files(cls, project_id: str, candidate_paths: Optional[List[Path]] = None):
+    def _cleanup_partial_files(
+        cls,
+        project_id: str,
+        candidate_paths: Optional[List[Path]] = None,
+        job_id: Optional[str] = None,
+        sweep_all_tmp: bool = False
+    ):
         """
         Remove arquivos parciais/temporários gerados por uma tarefa cancelada ou interrompida,
-        nunca tocando em artefatos já validados e registrados por tarefas concluídas anteriormente.
+        nunca tocando em artefatos já validados e registrados por tarefas concluídas anteriormente
+        nem nos arquivos temporários ativos de outras tarefas concorrentes do mesmo projeto (Achado C).
+        - Quando `job_id` é informado (cancelamento/falha em runtime), remove apenas os arquivos em
+          `candidate_paths` e temporários cujo nome contenha `_{job_id}_`.
+        - A varredura ampla (`sweep_all_tmp=True`) só é executada na reconciliação de inicialização
+          (`reconcile_interrupted_jobs`), quando garantidamente não há tarefas em execução.
         """
         if candidate_paths:
             for p in candidate_paths:
                 try:
-                    if p and p.exists() and not p.is_dir():
+                    if p and p.exists() and not p.is_dir() and not p.is_symlink():
                         p.unlink(missing_ok=True)
                 except OSError:
                     pass
 
         project_dir = settings.STORAGE_DIR / project_id
-        if project_dir.exists() and project_dir.is_dir():
+        if project_dir.exists() and project_dir.is_dir() and not project_dir.is_symlink():
             for item in project_dir.iterdir():
                 if ".tmp." in item.name or item.name.endswith(".tmp"):
-                    try:
-                        item.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                    if sweep_all_tmp or (job_id and f"_{job_id}_" in item.name):
+                        try:
+                            item.unlink(missing_ok=True)
+                        except OSError:
+                            pass
 
     @classmethod
     def update_job_status(
@@ -264,7 +287,14 @@ class JobOrchestrator:
 
             task = cls._running_tasks.get(job_id)
             if task is not None and not task.done():
-                task.cancel()
+                try:
+                    t_loop = task.get_loop()
+                    if t_loop.is_running():
+                        t_loop.call_soon_threadsafe(task.cancel)
+                    else:
+                        task.cancel()
+                except Exception:
+                    task.cancel()
 
         return True
 
@@ -289,7 +319,7 @@ class JobOrchestrator:
 
         def check_cancel():
             if cancel_event.is_set() or cls.is_cancel_requested(job_id):
-                cls._cleanup_partial_files(project_id, [model_path] if model_path else None)
+                cls._cleanup_partial_files(project_id, [model_path] if model_path else None, job_id=job_id)
                 raise JobCancelledException("Execução interrompida por solicitação de cancelamento.")
 
         try:
@@ -306,30 +336,37 @@ class JobOrchestrator:
             check_cancel()
             project_dir = settings.STORAGE_DIR / project_id
             project_dir.mkdir(parents=True, exist_ok=True)
-            model_filename = f"{shape_type}_{uuid.uuid4().hex[:6]}.glb"
+            base_stem = f"{shape_type}_{uuid.uuid4().hex[:6]}"
+            model_filename = f"{base_stem}.glb"
             model_path = project_dir / model_filename
+            candidate_files = [model_path]
 
             export_meta = ModelExporter.export_and_validate(
                 mesh,
                 model_path,
                 fmt="glb",
-                cancel_check=check_cancel
+                cancel_check=check_cancel,
+                job_id=job_id
             )
 
             # Checkpoint 4: Pós-exportação, antes de publicar resultado
             check_cancel()
 
+            rel_glb = str(model_path.relative_to(settings.BASE_DIR))
+
             return {
                 "model_path": model_path,
-                "rel_path": str(model_path.relative_to(settings.BASE_DIR)),
+                "candidate_files": candidate_files,
+                "rel_path": rel_glb,
+                "result_files": [rel_glb],
                 "inspect_info": inspect_info,
-                "export_meta": export_meta
+                "export_meta": export_meta,
             }
         except JobCancelledException:
-            cls._cleanup_partial_files(project_id, [model_path] if model_path else None)
+            cls._cleanup_partial_files(project_id, locals().get("candidate_files") or ([model_path] if model_path else None), job_id=job_id)
             raise
         except BaseException:
-            cls._cleanup_partial_files(project_id, [model_path] if model_path else None)
+            cls._cleanup_partial_files(project_id, locals().get("candidate_files") or ([model_path] if model_path else None), job_id=job_id)
             raise
 
     @classmethod
@@ -343,6 +380,7 @@ class JobOrchestrator:
 
         semaphore = cls._get_semaphore()
         model_path: Optional[Path] = None
+        candidate_files: Optional[List[Path]] = None
 
         try:
             # Verificar cancelamento antes mesmo de adquirir o semáforo
@@ -392,13 +430,15 @@ class JobOrchestrator:
                     cancel_event
                 )
                 model_path = worker_result["model_path"]
+                candidate_files = worker_result.get("candidate_files", [model_path])
                 rel_path = worker_result["rel_path"]
+                result_files_list = worker_result.get("result_files", [rel_path])
                 inspect_info = worker_result["inspect_info"]
                 export_meta = worker_result["export_meta"]
 
                 # Verificação final antes de publicar o resultado no Projeto e marcar como Concluída
                 if cancel_event.is_set() or cls.is_cancel_requested(job_id):
-                    cls._cleanup_partial_files(project_id, [model_path])
+                    cls._cleanup_partial_files(project_id, candidate_files, job_id=job_id)
                     cls.update_job_status(
                         job_id,
                         JobStatus.CANCELLED,
@@ -419,7 +459,7 @@ class JobOrchestrator:
                             or not proj
                             or proj.status == "deleting"
                         ):
-                            cls._cleanup_partial_files(project_id, [model_path])
+                            cls._cleanup_partial_files(project_id, candidate_files, job_id=job_id)
                             if job_check and job_check.status != JobStatus.CANCELLED.value:
                                 job_check.status = JobStatus.CANCELLED.value
                                 job_check.completed_at = get_now()
@@ -428,7 +468,10 @@ class JobOrchestrator:
                             return
 
                         proj.active_model_path = rel_path
-                        proj.parameters_json = json.dumps(params)
+                        enriched_params = dict(params)
+                        enriched_params["coordinate_system"] = inspect_info.get("coordinate_system", "Y-up")
+                        enriched_params["geometry_schema_version"] = inspect_info.get("geometry_schema_version", 2)
+                        proj.parameters_json = json.dumps(enriched_params)
                         proj.updated_at = get_now()
                         db.commit()
                     finally:
@@ -438,15 +481,20 @@ class JobOrchestrator:
                     job_id,
                     JobStatus.COMPLETED,
                     progress=1.0,
-                    result_files=[rel_path],
-                    metadata={"inspection": inspect_info, "export": export_meta}
+                    result_files=result_files_list,
+                    metadata={
+                        "coordinate_system": inspect_info.get("coordinate_system", "Y-up"),
+                        "geometry_schema_version": inspect_info.get("geometry_schema_version", 2),
+                        "inspection": inspect_info,
+                        "export": export_meta,
+                    }
                 )
                 if not completed_ok:
                     # Caso tenha sido cancelado concorrentemente, não deixar arquivo órfão não registrado
-                    cls._cleanup_partial_files(project_id, [model_path])
+                    cls._cleanup_partial_files(project_id, candidate_files, job_id=job_id)
 
         except (asyncio.CancelledError, JobCancelledException):
-            cls._cleanup_partial_files(project_id, [model_path] if model_path else None)
+            cls._cleanup_partial_files(project_id, candidate_files or ([model_path] if model_path else None), job_id=job_id)
             cls.update_job_status(
                 job_id,
                 JobStatus.CANCELLED,
@@ -454,7 +502,7 @@ class JobOrchestrator:
                 metadata={"cancel_acknowledged": True}
             )
         except Exception as e:
-            cls._cleanup_partial_files(project_id, [model_path] if model_path else None)
+            cls._cleanup_partial_files(project_id, candidate_files or ([model_path] if model_path else None), job_id=job_id)
             cls.update_job_status(job_id, JobStatus.FAILED, error_message=str(e))
         finally:
             with cls._state_lock:
@@ -462,18 +510,82 @@ class JobOrchestrator:
                 cls._cancellation_events.pop(job_id, None)
 
     @classmethod
+    def get_active_task(cls, job_id: str) -> Optional[asyncio.Task]:
+        with cls._state_lock:
+            return cls._running_tasks.get(job_id)
+
+    @classmethod
+    def _ensure_background_loop(cls) -> asyncio.AbstractEventLoop:
+        """
+        Garante a existência de um event loop em background persistente quando a aplicação
+        é invocada sem lifespan ativo (ex: `TestClient(app)` instanciado sem bloco `with`),
+        evitando que o portal efêmero do TestClient cancele a task ao encerrar a requisição `POST /jobs`.
+        Quando o servidor FastAPI real está rodando (ou `with TestClient(app):`), `_main_loop` já está ativo
+        e é utilizado diretamente.
+        """
+        with cls._state_lock:
+            if cls._main_loop is not None and cls._main_loop.is_running():
+                return cls._main_loop
+            bg_loop = getattr(cls, "_bg_loop", None)
+            if bg_loop is not None and bg_loop.is_running():
+                return bg_loop
+
+            ready = threading.Event()
+            new_loop = asyncio.new_event_loop()
+
+            def _run_loop():
+                asyncio.set_event_loop(new_loop)
+                ready.set()
+                new_loop.run_forever()
+
+            t = threading.Thread(target=_run_loop, name="ai3d-job-orchestrator-loop", daemon=True)
+            t.start()
+            ready.wait(timeout=2.0)
+            cls._bg_loop = new_loop
+            return new_loop
+
+    @classmethod
     def dispatch_job(cls, job_id: str, project_id: str, params: Dict[str, Any]):
+        """
+        Agenda a execução assíncrona do job no event loop principal registrado (`_main_loop`),
+        no event loop ativo da coroutine ou no loop de background persistente, garantindo:
+        1. Retorno imediato de `POST /api/v1/jobs` sem bloquear o cliente HTTP;
+        2. Compartilhamento estrito do mesmo `asyncio.Semaphore(MAX_CONCURRENT_JOBS = 2)`.
+        """
         with cls._state_lock:
             cls._cancellation_events.setdefault(job_id, threading.Event())
+            main_loop = cls._main_loop
+
+        target_loop: Optional[asyncio.AbstractEventLoop] = None
+        if main_loop is not None and main_loop.is_running():
+            target_loop = main_loop
+        else:
+            target_loop = cls._ensure_background_loop()
+
         try:
-            loop = asyncio.get_running_loop()
-            task = loop.create_task(cls.run_procedural_job_async(job_id, project_id, params))
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is target_loop:
+            task = target_loop.create_task(cls.run_procedural_job_async(job_id, project_id, params))
             with cls._state_lock:
                 cls._running_tasks[job_id] = task
             return task
-        except RuntimeError:
-            # Sem loop ativo (ex: chamadas síncronas diretas via TestClient síncrono)
-            return asyncio.run(cls.run_procedural_job_async(job_id, project_id, params))
+        else:
+            scheduled = threading.Event()
+            task_holder: Dict[str, asyncio.Task] = {}
+
+            def _schedule_on_target():
+                t = target_loop.create_task(cls.run_procedural_job_async(job_id, project_id, params))
+                with cls._state_lock:
+                    cls._running_tasks[job_id] = t
+                task_holder["task"] = t
+                scheduled.set()
+
+            target_loop.call_soon_threadsafe(_schedule_on_target)
+            scheduled.wait(timeout=1.0)
+            return task_holder.get("task")
 
     @classmethod
     async def shutdown_active_jobs(cls, timeout: float = 2.0):

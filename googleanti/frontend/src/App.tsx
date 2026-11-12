@@ -1,113 +1,224 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { ModelViewer } from './viewer/ModelViewer';
-import type { ThreeViewer } from './viewer/ThreeViewer';
+import type { ThreeViewer, MeshTelemetryInfo } from './viewer/ThreeViewer';
 import { GenerationPanel } from './features/generation/GenerationPanel';
-import { apiService, type Project, type Job } from './services/api';
-import { Box, Eye, Grid, Download, FolderPlus, Info } from 'lucide-react';
+import {
+  apiService,
+  type Project,
+  type Job,
+  type SupportedExportFormat,
+  extractFilenameFromPath,
+} from './services/api';
+import { Box, Eye, Grid, Download, FolderPlus, Info, Compass, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 
 export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [currentProject, setCurrentProject] = useState<Project | null>(null);
   const [activeJob, setActiveJob] = useState<Job | null>(null);
-  console.debug('Active Job:', activeJob?.id);
   const [modelUrl, setModelUrl] = useState<string | null>(null);
-  const [telemetry, setTelemetry] = useState<{ vertexCount: number; faceCount: number; dimensions: [number, number, number] } | null>(null);
+  const [coordinateSystem, setCoordinateSystem] = useState<'Y-up' | 'legacy_z_up'>('Y-up');
+  const [telemetry, setTelemetry] = useState<MeshTelemetryInfo | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [selectedExportFormat, setSelectedExportFormat] = useState<SupportedExportFormat>('glb');
+  const [availableFormats, setAvailableFormats] = useState<Record<string, string>>({});
   const [isWireframe, setIsWireframe] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>('Pronto para iniciar');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const viewerRef = useRef<ThreeViewer | null>(null);
+  const pollIntervalRef = useRef<number | null>(null);
 
-  // Carregar ou inicializar projetos
-  useEffect(() => {
-    loadProjects();
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current !== null) {
+      window.clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
   }, []);
 
-  const loadProjects = async () => {
+  useEffect(() => {
+    return () => {
+      stopPolling();
+    };
+  }, [stopPolling]);
+
+  const refreshProjectArtifacts = useCallback(async (projectId: string) => {
+    try {
+      const info = await apiService.listProjectArtifacts(projectId);
+      setAvailableFormats(info.active_formats || {});
+    } catch {
+      setAvailableFormats({});
+    }
+  }, []);
+
+  const selectProjectAndLoadModel = useCallback(
+    async (project: Project) => {
+      setCurrentProject(project);
+      setErrorMessage(null);
+      const coord = project.coordinate_system === 'legacy_z_up' ? 'legacy_z_up' : 'Y-up';
+      setCoordinateSystem(coord);
+
+      if (project.active_model_path) {
+        const contextualUrl = apiService.getArtifactDownloadUrl(project.id, project.active_model_path);
+        setModelUrl(contextualUrl);
+        await refreshProjectArtifacts(project.id);
+      } else {
+        setModelUrl(null);
+        setTelemetry(null);
+        setAvailableFormats({});
+      }
+    },
+    [refreshProjectArtifacts]
+  );
+
+  const loadProjects = useCallback(async () => {
     try {
       const list = await apiService.listProjects();
       setProjects(list);
       if (list.length > 0) {
-        setCurrentProject(list[0]);
-        if (list[0].active_model_path) {
-          setModelUrl(apiService.getFileDownloadUrl(list[0].active_model_path));
-        }
+        await selectProjectAndLoadModel(list[0]);
       } else {
-        // Criar projeto inicial padrão
         const initial = await apiService.createProject({
           name: 'Projeto Principal',
           description: 'Projeto padrão do AI 3D Studio',
-          category: 'mechanical'
+          category: 'mechanical',
         });
         setProjects([initial]);
-        setCurrentProject(initial);
+        await selectProjectAndLoadModel(initial);
       }
     } catch (err) {
       console.error(err);
       setStatusMessage('Aviso: Backend local ainda não conectado ou inicializando.');
     }
-  };
+  }, [selectProjectAndLoadModel]);
+
+  useEffect(() => {
+    loadProjects();
+  }, [loadProjects]);
 
   const handleCreateNewProject = async () => {
     const name = prompt('Nome do novo projeto:', `Projeto ${projects.length + 1}`);
     if (!name) return;
     try {
+      setErrorMessage(null);
       const created = await apiService.createProject({ name });
-      setProjects([created, ...projects]);
-      setCurrentProject(created);
-      setModelUrl(null);
-      setTelemetry(null);
+      setProjects((prev) => [created, ...prev]);
+      await selectProjectAndLoadModel(created);
       setStatusMessage(`Projeto "${name}" criado com sucesso.`);
-    } catch (e: any) {
-      alert(`Erro: ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setErrorMessage(`Erro ao criar projeto: ${msg}`);
     }
   };
 
-  const handleGenerate = async (shapeType: string, params: Record<string, any>) => {
+  const pollJob = useCallback(
+    (jobId: string, projectId: string) => {
+      stopPolling();
+      pollIntervalRef.current = window.setInterval(async () => {
+        try {
+          const job = await apiService.getJob(jobId);
+          setActiveJob(job);
+          setStatusMessage(`Tarefa ${job.status}...`);
+
+          if (job.status === 'Concluída') {
+            stopPolling();
+            setIsLoading(false);
+            setErrorMessage(null);
+            setStatusMessage('Modelo 3D gerado e validado com sucesso!');
+
+            const updatedProject = await apiService.getProject(projectId);
+            setProjects((prev) => prev.map((p) => (p.id === updatedProject.id ? updatedProject : p)));
+            await selectProjectAndLoadModel(updatedProject);
+          } else if (job.status === 'Falhou' || job.status === 'Cancelada') {
+            stopPolling();
+            setIsLoading(false);
+            const reason = job.error_message || (job.status === 'Cancelada' ? 'Cancelada pelo usuário.' : 'Erro desconhecido.');
+            setStatusMessage(`Tarefa ${job.status}: ${reason}`);
+            if (job.status === 'Falhou') {
+              setErrorMessage(reason);
+            }
+          }
+        } catch (e: unknown) {
+          stopPolling();
+          setIsLoading(false);
+          const msg = e instanceof Error ? e.message : String(e);
+          setErrorMessage(`Erro ao acompanhar tarefa: ${msg}`);
+        }
+      }, 350);
+    },
+    [selectProjectAndLoadModel, stopPolling]
+  );
+
+  const handleGenerate = async (shapeType: string, params: Record<string, unknown>) => {
     if (!currentProject) return;
+    setErrorMessage(null);
     setIsLoading(true);
     setStatusMessage(`Disparando geração de ${shapeType}...`);
 
     try {
       const job = await apiService.startProceduralJob(currentProject.id, {
         shape_type: shapeType,
-        ...params
+        ...params,
       });
       setActiveJob(job);
-      pollJob(job.id);
-    } catch (err: any) {
+      pollJob(job.id, currentProject.id);
+    } catch (err: unknown) {
       setIsLoading(false);
-      setStatusMessage(`Erro na solicitação: ${err.message}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorMessage(msg);
+      setStatusMessage(`Falha na validação/solicitação: ${msg}`);
     }
   };
 
-  const pollJob = (jobId: string) => {
-    const interval = setInterval(async () => {
-      try {
-        const job = await apiService.getJob(jobId);
-        setActiveJob(job);
-        setStatusMessage(`Tarefa ${job.status}...`);
-
-        if (job.status === 'Concluída') {
-          clearInterval(interval);
-          setIsLoading(false);
-          setStatusMessage('Modelo gerado com sucesso!');
-          if (job.result_files && job.result_files.length > 0) {
-            const url = apiService.getFileDownloadUrl(job.result_files[0]);
-            setModelUrl(url);
-          }
-          loadProjects();
-        } else if (job.status === 'Falhou' || job.status === 'Cancelada') {
-          clearInterval(interval);
-          setIsLoading(false);
-          setStatusMessage(`Tarefa ${job.status}: ${job.error_message || 'Erro desconhecido'}`);
-        }
-      } catch (e) {
-        clearInterval(interval);
+  const handleCancelActiveJob = async () => {
+    if (!activeJob) return;
+    try {
+      setStatusMessage('Solicitando cancelamento cooperativo da tarefa...');
+      await apiService.cancelJob(activeJob.id);
+      const updated = await apiService.getJob(activeJob.id);
+      setActiveJob(updated);
+      if (updated.status === 'Cancelada' || updated.status === 'Concluída' || updated.status === 'Falhou') {
+        stopPolling();
         setIsLoading(false);
+        setStatusMessage(`Tarefa ${updated.status}: ${updated.error_message || 'Operação encerrada.'}`);
       }
-    }, 500);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorMessage(`Não foi possível cancelar a tarefa: ${msg}`);
+    }
   };
+
+  const handleExportAndDownload = async () => {
+    if (!currentProject) return;
+    setErrorMessage(null);
+    setIsExporting(true);
+    try {
+      setStatusMessage(`Preparando exportação validada em ${selectedExportFormat.toUpperCase()}...`);
+      const exported = await apiService.exportProjectModelFormat(currentProject.id, selectedExportFormat);
+      await refreshProjectArtifacts(currentProject.id);
+
+      const downloadUrl = apiService.getArtifactDownloadUrl(currentProject.id, exported.filename);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = exported.filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setStatusMessage(`Download iniciado: ${exported.filename} (${selectedExportFormat.toUpperCase()} validado).`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorMessage(msg);
+      setStatusMessage(`Erro na exportação: ${msg}`);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const activeInspection =
+    activeJob?.metadata && typeof activeJob.metadata === 'object' && 'inspection' in activeJob.metadata
+      ? (activeJob.metadata.inspection as Record<string, unknown>)
+      : null;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#09090b', color: '#f4f4f5', fontFamily: 'sans-serif' }}>
@@ -117,7 +228,7 @@ export function App() {
           <Box color="#3b82f6" size={26} />
           <div>
             <h1 style={{ fontSize: '18px', fontWeight: 'bold', margin: 0 }}>AI 3D STUDIO</h1>
-            <span style={{ fontSize: '11px', color: '#71717a' }}>v2.1 Universal • 100% Local (127.0.0.1) • Sem Blender</span>
+            <span style={{ fontSize: '11px', color: '#71717a' }}>v2.1 Universal • 100% Local (127.0.0.1) • Convenção Nativa Y-up</span>
           </div>
         </div>
 
@@ -128,8 +239,7 @@ export function App() {
             onChange={(e) => {
               const p = projects.find((proj) => proj.id === e.target.value);
               if (p) {
-                setCurrentProject(p);
-                setModelUrl(p.active_model_path ? apiService.getFileDownloadUrl(p.active_model_path) : null);
+                selectProjectAndLoadModel(p);
               }
             }}
             style={{ padding: '6px 12px', background: '#27272a', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px' }}
@@ -149,47 +259,192 @@ export function App() {
 
       {/* Main Content Layout */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        {/* Left Sidebar: Controls & Generation */}
-        <aside style={{ width: '380px', background: '#121215', borderRight: '1px solid #27272a', padding: '16px', overflowY: 'auto' }}>
-          <GenerationPanel onGenerate={handleGenerate} isLoading={isLoading} />
+        {/* Left Sidebar: Controls, Status, Telemetry & Multiformat Export */}
+        <aside style={{ width: '390px', background: '#121215', borderRight: '1px solid #27272a', padding: '16px', overflowY: 'auto' }}>
+          <GenerationPanel
+            onGenerate={handleGenerate}
+            onCancel={handleCancelActiveJob}
+            isLoading={isLoading}
+            activeJobStatus={activeJob?.status || null}
+          />
 
-          {/* Telemetria da Malha */}
-          {telemetry && (
-            <div style={{ marginTop: '16px', background: '#18181b', padding: '14px', borderRadius: '8px', border: '1px solid #27272a' }}>
-              <h4 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 10px 0', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Info size={16} color="#10b981" /> Métricas e Telemetria Real
-              </h4>
-              <div style={{ fontSize: '12px', color: '#d4d4d8', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <div><strong>Vértices:</strong> {telemetry.vertexCount.toLocaleString()}</div>
-                <div><strong>Faces / Triângulos:</strong> {telemetry.faceCount.toLocaleString()}</div>
-                <div><strong>Dimensões (X×Y×Z):</strong> {telemetry.dimensions[0]}m × {telemetry.dimensions[1]}m × {telemetry.dimensions[2]}m</div>
+          {/* Alerta de Erro Claro em Português */}
+          {errorMessage && (
+            <div
+              style={{
+                marginTop: '12px',
+                background: '#450a0a',
+                border: '1px solid #dc2626',
+                borderRadius: '8px',
+                padding: '12px',
+                color: '#fecaca',
+                fontSize: '12px',
+                display: 'flex',
+                gap: '8px',
+                alignItems: 'flex-start',
+              }}
+            >
+              <AlertTriangle size={16} color="#f87171" style={{ flexShrink: 0, marginTop: '2px' }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, marginBottom: '2px' }}>Atenção</div>
+                <div>{errorMessage}</div>
               </div>
             </div>
           )}
 
-          {/* Download de Arquivos */}
-          {modelUrl && (
-            <div style={{ marginTop: '16px', background: '#18181b', padding: '14px', borderRadius: '8px', border: '1px solid #27272a' }}>
-              <h4 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 10px 0' }}>Exportar Modelo</h4>
-              <a
-                href={modelUrl}
-                download="modelo_gerado.glb"
+          {/* Card de Status da Tarefa Ativa / Recente */}
+          {activeJob && (
+            <div style={{ marginTop: '12px', background: '#18181b', padding: '12px 14px', borderRadius: '8px', border: '1px solid #27272a', fontSize: '12px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                <span style={{ color: '#a1a1aa' }}>Tarefa: <code>{activeJob.id}</code></span>
+                <span
+                  style={{
+                    padding: '2px 8px',
+                    borderRadius: '999px',
+                    fontWeight: 600,
+                    fontSize: '11px',
+                    background:
+                      activeJob.status === 'Concluída'
+                        ? '#064e3b'
+                        : activeJob.status === 'Cancelada' || activeJob.status === 'Falhou'
+                        ? '#7f1d1d'
+                        : '#1e3a8a',
+                    color:
+                      activeJob.status === 'Concluída'
+                        ? '#6ee7b7'
+                        : activeJob.status === 'Cancelada' || activeJob.status === 'Falhou'
+                        ? '#fca5a5'
+                        : '#93c5fd',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                  }}
+                >
+                  {activeJob.status === 'Concluída' && <CheckCircle2 size={12} />}
+                  {(activeJob.status === 'Cancelada' || activeJob.status === 'Falhou') && <XCircle size={12} />}
+                  {activeJob.status}
+                </span>
+              </div>
+              {typeof activeJob.progress === 'number' && (
+                <div style={{ width: '100%', height: '6px', background: '#27272a', borderRadius: '3px', overflow: 'hidden' }}>
+                  <div
+                    style={{
+                      width: `${Math.min(100, Math.max(0, Math.round(activeJob.progress * 100)))}%`,
+                      height: '100%',
+                      background: activeJob.status === 'Concluída' ? '#10b981' : '#3b82f6',
+                      transition: 'width 0.2s ease',
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Telemetria Real da Malha */}
+          {telemetry && (
+            <div style={{ marginTop: '14px', background: '#18181b', padding: '14px', borderRadius: '8px', border: '1px solid #27272a' }}>
+              <h4 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 10px 0', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Info size={16} color="#10b981" /> Métricas e Telemetria Real (Y-up)
+              </h4>
+              <div style={{ fontSize: '12px', color: '#d4d4d8', display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                <div><strong>Vértices (Buffer WebGL):</strong> {telemetry.vertexCount.toLocaleString()}</div>
+                <div><strong>Faces / Triângulos:</strong> {telemetry.faceCount.toLocaleString()}</div>
+                <div>
+                  <strong>Dimensões (X × Y × Z):</strong>{' '}
+                  {telemetry.dimensions[0]}m × {telemetry.dimensions[1]}m (Altura) × {telemetry.dimensions[2]}m
+                </div>
+                <div>
+                  <strong>Limites Y (Solo XZ):</strong> Y<sub>min</sub> = {telemetry.boundsMin[1]}m → Y<sub>máx</sub> = {telemetry.boundsMax[1]}m
+                </div>
+                <div>
+                  <strong>Convenção:</strong>{' '}
+                  <span style={{ color: '#34d399', fontWeight: 600 }}>
+                    {telemetry.coordinateSystem === 'legacy_z_up' ? 'Legado Z-up (Normalizado p/ Y-up)' : 'Y-up Nativo (glTF 2.0)'}
+                  </span>
+                </div>
+                {activeInspection && typeof activeInspection.is_watertight === 'boolean' && (
+                  <div>
+                    <strong>Malha Estanque (Watertight):</strong> {activeInspection.is_watertight ? 'Sim' : 'Não'}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Exportação e Download Multiformato Contextual Seguro (GLB, OBJ, STL) */}
+          {currentProject?.active_model_path && (
+            <div style={{ marginTop: '14px', background: '#18181b', padding: '14px', borderRadius: '8px', border: '1px solid #27272a' }}>
+              <h4 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 10px 0' }}>
+                Exportar e Baixar Artefato Validado
+              </h4>
+
+              <div style={{ marginBottom: '10px' }}>
+                <label style={{ display: 'block', fontSize: '12px', color: '#a1a1aa', marginBottom: '4px' }}>
+                  Formato de Exportação:
+                </label>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '6px' }}>
+                  {(['glb', 'obj', 'stl'] as SupportedExportFormat[]).map((fmt) => {
+                    const isSelected = selectedExportFormat === fmt;
+                    const isReadyOnDisk = Boolean(availableFormats[fmt]);
+                    return (
+                      <button
+                        key={fmt}
+                        type="button"
+                        onClick={() => setSelectedExportFormat(fmt)}
+                        style={{
+                          padding: '7px 8px',
+                          borderRadius: '6px',
+                          border: isSelected ? '1px solid #10b981' : '1px solid #3f3f46',
+                          background: isSelected ? '#064e3b' : '#27272a',
+                          color: '#fff',
+                          fontWeight: 600,
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          gap: '2px',
+                        }}
+                      >
+                        <span>.{fmt.toUpperCase()}</span>
+                        <span style={{ fontSize: '10px', color: isReadyOnDisk ? '#6ee7b7' : '#a1a1aa', fontWeight: 400 }}>
+                          {isReadyOnDisk ? 'Disponível' : 'Gerar sob demanda'}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                disabled={isExporting || isLoading}
+                onClick={handleExportAndDownload}
                 style={{
+                  width: '100%',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   gap: '8px',
-                  padding: '8px',
-                  background: '#059669',
+                  padding: '9px',
+                  background: isExporting ? '#05966988' : '#059669',
                   color: '#fff',
-                  textDecoration: 'none',
+                  border: 'none',
                   borderRadius: '6px',
                   fontWeight: 600,
-                  fontSize: '13px'
+                  fontSize: '13px',
+                  cursor: isExporting || isLoading ? 'not-allowed' : 'pointer',
                 }}
               >
-                <Download size={16} /> Baixar Arquivo GLB Validado
-              </a>
+                <Download size={16} />
+                {isExporting
+                  ? `Exportando .${selectedExportFormat.toUpperCase()}...`
+                  : `Baixar Arquivo .${selectedExportFormat.toUpperCase()} Validado`}
+              </button>
+
+              <div style={{ marginTop: '8px', fontSize: '11px', color: '#71717a', wordBreak: 'break-all' }}>
+                Rota segura: <code>/api/v1/projects/{currentProject.id}/artifacts/{availableFormats[selectedExportFormat] || extractFilenameFromPath(currentProject.active_model_path).replace(/\.glb$/i, `.${selectedExportFormat}`)}</code>
+              </div>
             </div>
           )}
         </aside>
@@ -197,7 +452,7 @@ export function App() {
         {/* Center: 3D WebGL Viewport */}
         <main style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column' }}>
           {/* Viewport Toolbar */}
-          <div style={{ position: 'absolute', top: '16px', left: '16px', zIndex: 10, display: 'flex', gap: '8px' }}>
+          <div style={{ position: 'absolute', top: '16px', left: '16px', zIndex: 10, display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
             <button
               onClick={() => {
                 if (viewerRef.current) {
@@ -205,15 +460,27 @@ export function App() {
                   setIsWireframe(state);
                 }
               }}
-              style={{ padding: '6px 12px', background: '#18181bcc', backdropFilter: 'blur(4px)', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
+              style={{ padding: '6px 10px', background: '#18181bcc', backdropFilter: 'blur(4px)', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
             >
               <Eye size={14} /> {isWireframe ? 'Modo Sólido' : 'Modo Aramado'}
             </button>
             <button
               onClick={() => viewerRef.current?.toggleGrid()}
-              style={{ padding: '6px 12px', background: '#18181bcc', backdropFilter: 'blur(4px)', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
+              style={{ padding: '6px 10px', background: '#18181bcc', backdropFilter: 'blur(4px)', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
             >
-              <Grid size={14} /> Grade
+              <Grid size={14} /> Grade XZ
+            </button>
+            <button
+              onClick={() => viewerRef.current?.toggleAxes()}
+              style={{ padding: '6px 10px', background: '#18181bcc', backdropFilter: 'blur(4px)', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
+            >
+              <Compass size={14} /> Eixos Y-up
+            </button>
+            <button
+              onClick={() => viewerRef.current?.fitCameraToCurrentModel()}
+              style={{ padding: '6px 10px', background: '#18181bcc', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+            >
+              Enquadrar
             </button>
             <button
               onClick={() => viewerRef.current?.setView('front')}
@@ -222,10 +489,34 @@ export function App() {
               Frente
             </button>
             <button
+              onClick={() => viewerRef.current?.setView('back')}
+              style={{ padding: '6px 10px', background: '#18181bcc', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+            >
+              Trás
+            </button>
+            <button
+              onClick={() => viewerRef.current?.setView('left')}
+              style={{ padding: '6px 10px', background: '#18181bcc', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+            >
+              Esquerda
+            </button>
+            <button
+              onClick={() => viewerRef.current?.setView('right')}
+              style={{ padding: '6px 10px', background: '#18181bcc', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+            >
+              Direita
+            </button>
+            <button
               onClick={() => viewerRef.current?.setView('top')}
               style={{ padding: '6px 10px', background: '#18181bcc', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
             >
-              Topo
+              Topo (+Y)
+            </button>
+            <button
+              onClick={() => viewerRef.current?.setView('bottom')}
+              style={{ padding: '6px 10px', background: '#18181bcc', color: '#fff', border: '1px solid #3f3f46', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+            >
+              Base (-Y)
             </button>
             <button
               onClick={() => viewerRef.current?.setView('iso')}
@@ -235,9 +526,33 @@ export function App() {
             </button>
           </div>
 
+          {/* Legenda Visual de Eixos Y-up */}
+          <div
+            style={{
+              position: 'absolute',
+              top: '16px',
+              right: '16px',
+              zIndex: 10,
+              padding: '6px 10px',
+              background: '#18181bcc',
+              backdropFilter: 'blur(4px)',
+              border: '1px solid #3f3f46',
+              borderRadius: '6px',
+              fontSize: '11px',
+              display: 'flex',
+              gap: '10px',
+              alignItems: 'center',
+            }}
+          >
+            <span style={{ color: '#ef4444', fontWeight: 600 }}>● X: Largura</span>
+            <span style={{ color: '#22c55e', fontWeight: 600 }}>● Y: Altura (Cima)</span>
+            <span style={{ color: '#3b82f6', fontWeight: 600 }}>● Z: Profundidade</span>
+          </div>
+
           <div style={{ flex: 1, width: '100%', height: '100%' }}>
             <ModelViewer
               modelUrl={modelUrl}
+              coordinateSystem={coordinateSystem}
               viewerRef={viewerRef}
               onMeshLoaded={(info) => setTelemetry(info)}
             />
@@ -246,7 +561,7 @@ export function App() {
           {/* Bottom Status Bar */}
           <footer style={{ padding: '6px 16px', background: '#18181b', borderTop: '1px solid #27272a', fontSize: '12px', color: '#a1a1aa', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div>Status: <span style={{ color: '#60a5fa' }}>{statusMessage}</span></div>
-            <div>Controles: Botão Esquerdo (Órbita) • Botão Direito (Pan) • Scroll (Zoom)</div>
+            <div>Controles: Botão Esquerdo (Órbita) • Botão Direito (Pan) • Scroll (Zoom) • Plano Base XZ (Y=0)</div>
           </footer>
         </main>
       </div>
@@ -255,3 +570,4 @@ export function App() {
 }
 
 export default App;
+

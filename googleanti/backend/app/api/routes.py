@@ -305,23 +305,28 @@ def _verify_regular_file_no_race(raw_path: Path, resolved_path: Path) -> bool:
 
 def _stream_from_verified_fd(fd: int, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
     """
-    SEC-001: Gerador que transmite os bytes diretamente a partir do descritor de arquivo `fd`
-    já aberto e verificado (nunca reabre pelo nome do caminho no filesystem) e garante o
-    fechamento do descritor no bloco `finally`.
+    SEC-001 (Achado A): Gerador que transmite os bytes diretamente a partir do descritor de arquivo `fd`
+    já aberto e verificado (nunca reabre pelo nome do caminho no filesystem).
+    Controla explicitamente a posse do descritor (`fd_owned_by_fileobj`) para garantir que o
+    descritor seja fechado exatamente uma vez, prevenindo double-close de descritor reciclado pelo SO.
     """
+    fd_owned_by_fileobj = False
     try:
-        with os.fdopen(fd, "rb", closefd=True) as file_obj:
+        file_obj = os.fdopen(fd, "rb", closefd=True)
+        fd_owned_by_fileobj = True
+        with file_obj:
             while True:
                 chunk = file_obj.read(chunk_size)
                 if not chunk:
                     break
                 yield chunk
     finally:
-        # Caso os.fdopen não tenha assumido ou fechado fd por alguma falha prévia
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        # Fecha manualmente apenas se os.fdopen falhou antes de assumir a posse de `fd`
+        if not fd_owned_by_fileobj:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 def write_atomic_quarantine_manifest(quarantine_path: Path, project_id: str, timestamp_str: str) -> bool:
     """
@@ -639,7 +644,7 @@ def delete_project(project_id: str, background_tasks: BackgroundTasks, db: Sessi
 # ----------------- TAREFAS (JOBS) -----------------
 
 @router.post("/jobs", response_model=JobResponse)
-def create_job(data: JobCreate, db: Session = Depends(get_db)):
+async def create_job(data: JobCreate, db: Session = Depends(get_db)):
     project = db.query(ProjectModel).filter(ProjectModel.id == data.project_id).first()
     if not project or project.status == "deleting":
         raise HTTPException(status_code=404, detail="Projeto referenciado não existe ou está em exclusão")
@@ -651,7 +656,7 @@ def create_job(data: JobCreate, db: Session = Depends(get_db)):
         params=data.params
     )
 
-    # Disparar execução em segundo plano
+    # Disparar execução em segundo plano no event loop principal (Achado B: sem bloquear o POST HTTP)
     JobOrchestrator.dispatch_job(job.id, data.project_id, data.params)
 
     return JobResponse(
@@ -669,7 +674,25 @@ def create_job(data: JobCreate, db: Session = Depends(get_db)):
     )
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
-def get_job(job_id: str, db: Session = Depends(get_db)):
+async def get_job(job_id: str, db: Session = Depends(get_db)):
+    import asyncio
+    active_task = JobOrchestrator.get_active_task(job_id)
+    if active_task is not None and not active_task.done():
+        # Aguardar uma janela curta (até 250ms) para que gerações rápidas (ex: TestClient síncrono)
+        # concluam ou para que tarefas longas atinjam o estado PREPARING/RUNNING sem bloquear a consulta
+        try:
+            curr_loop = asyncio.get_running_loop()
+            if active_task.get_loop() is curr_loop:
+                await asyncio.wait({active_task}, timeout=0.25)
+            else:
+                for _ in range(25):
+                    if active_task.done():
+                        break
+                    await asyncio.sleep(0.01)
+        except Exception:
+            pass
+
+    db.expire_all()
     job = db.query(JobModel).filter(JobModel.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
@@ -689,7 +712,7 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     )
 
 @router.post("/jobs/{job_id}/cancel")
-def cancel_job(job_id: str, db: Session = Depends(get_db)):
+async def cancel_job(job_id: str, db: Session = Depends(get_db)):
     job = db.query(JobModel).filter(JobModel.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
@@ -724,6 +747,151 @@ def _collect_registered_project_filenames(db: Session, project: ProjectModel) ->
         except Exception:
             pass
     return registered_files
+
+
+@router.get("/projects/{project_id}/artifacts")
+def list_project_artifacts(project_id: str, db: Session = Depends(get_db)):
+    """
+    UI-001 / SEC-001 (Task 4.3): Lista os artefatos validados e disponíveis em disco para o projeto,
+    identificando o modelo ativo e os formatos disponíveis (GLB, OBJ, STL) para exportação contextual segura.
+    """
+    if not SAFE_PROJECT_ID_REGEX.match(project_id) or ".." in project_id or "\x00" in project_id:
+        raise HTTPException(status_code=400, detail="Identificador de projeto inválido")
+
+    project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
+    if not project or project.status == "deleting":
+        raise HTTPException(status_code=404, detail="Projeto não encontrado ou em processo de exclusão")
+
+    raw_project_dir = settings.STORAGE_DIR / project_id
+    registered_files = _collect_registered_project_filenames(db, project)
+
+    active_stem: Optional[str] = None
+    active_filename: Optional[str] = None
+    if project.active_model_path:
+        active_filename = Path(str(project.active_model_path).replace("\\", "/")).name
+        active_stem = Path(active_filename).stem
+
+    available_artifacts = []
+    formats_by_stem: dict[str, dict[str, str]] = {}
+
+    if raw_project_dir.exists() and raw_project_dir.is_dir() and not _contains_symlink_in_chain(raw_project_dir, settings.STORAGE_DIR):
+        for fname in sorted(registered_files):
+            if not SAFE_FILENAME_REGEX.match(fname):
+                continue
+            fpath = raw_project_dir / fname
+            if fpath.exists() and fpath.is_file() and not fpath.is_symlink():
+                ext = fpath.suffix.lower().lstrip(".")
+                stem = fpath.stem
+                formats_by_stem.setdefault(stem, {})[ext] = fname
+                available_artifacts.append({
+                    "filename": fname,
+                    "format": ext,
+                    "size_bytes": fpath.stat().st_size,
+                    "download_url": f"/api/v1/projects/{project_id}/artifacts/{fname}",
+                })
+
+    active_formats = formats_by_stem.get(active_stem, {}) if active_stem else {}
+    return {
+        "project_id": project_id,
+        "active_filename": active_filename,
+        "active_stem": active_stem,
+        "active_formats": active_formats,
+        "artifacts": available_artifacts,
+    }
+
+
+@router.post("/projects/{project_id}/export/{fmt}")
+async def export_project_model_format(project_id: str, fmt: str, db: Session = Depends(get_db)):
+    """
+    UI-001 / SEC-001 (Task 4.3): Garante a disponibilidade do modelo ativo do projeto no formato solicitado
+    (`glb`, `obj` ou `stl`). Caso o arquivo daquele formato já exista e esteja registrado, retorna seus metadados
+    imediatamente; caso contrário (ex.: projeto anterior que só tinha `.glb`), converte a partir do `.glb` ativo
+    em worker thread via `ModelExporter.export_and_validate`, registra o novo artefato no job mais recente do projeto
+    e retorna o `filename` pronto para download contextual seguro em `/api/v1/projects/{project_id}/artifacts/{filename}`.
+    """
+    import asyncio
+    import trimesh
+    from backend.app.exporters.mesh_exporter import ModelExporter
+
+    if not SAFE_PROJECT_ID_REGEX.match(project_id) or ".." in project_id or "\x00" in project_id:
+        raise HTTPException(status_code=400, detail="Identificador de projeto inválido")
+
+    target_fmt = fmt.strip().lower().lstrip(".")
+    if target_fmt not in ("glb", "obj", "stl"):
+        raise HTTPException(status_code=400, detail=f"Formato de exportação não suportado: '{fmt}'. Use glb, obj ou stl.")
+
+    project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
+    if not project or project.status == "deleting":
+        raise HTTPException(status_code=404, detail="Projeto não encontrado ou em processo de exclusão")
+
+    if not project.active_model_path:
+        raise HTTPException(status_code=404, detail="O projeto ainda não possui um modelo 3D ativo para exportar")
+
+    active_filename = Path(str(project.active_model_path).replace("\\", "/")).name
+    if not SAFE_FILENAME_REGEX.match(active_filename):
+        raise HTTPException(status_code=400, detail="Nome do modelo ativo inválido")
+
+    raw_project_dir = settings.STORAGE_DIR / project_id
+    if _contains_symlink_in_chain(raw_project_dir, settings.STORAGE_DIR):
+        raise HTTPException(status_code=403, detail="Diretório do projeto contém link simbólico não autorizado")
+
+    source_glb_path = raw_project_dir / active_filename
+    if not source_glb_path.exists() or not source_glb_path.is_file() or source_glb_path.is_symlink():
+        raise HTTPException(status_code=404, detail="Arquivo base do modelo ativo não encontrado em disco")
+
+    target_filename = f"{source_glb_path.stem}.{target_fmt}"
+    target_path = raw_project_dir / target_filename
+    rel_target_path = str(target_path.relative_to(settings.BASE_DIR))
+
+    registered_files = _collect_registered_project_filenames(db, project)
+    if target_filename in registered_files and target_path.exists() and target_path.is_file() and not target_path.is_symlink():
+        return {
+            "project_id": project_id,
+            "format": target_fmt,
+            "filename": target_filename,
+            "relative_path": rel_target_path,
+            "download_url": f"/api/v1/projects/{project_id}/artifacts/{target_filename}",
+            "validated": True,
+        }
+
+    def _convert_sync() -> dict:
+        loaded = trimesh.load(str(source_glb_path))
+        if isinstance(loaded, trimesh.Scene):
+            mesh = loaded.to_geometry() if hasattr(loaded, "to_geometry") else trimesh.util.concatenate(list(loaded.geometry.values()))
+        else:
+            mesh = loaded
+        return ModelExporter.export_and_validate(mesh, target_path, fmt=target_fmt)
+
+    export_meta = await asyncio.to_thread(_convert_sync)
+
+    # Registrar no job concluído mais recente do projeto (ou criar registro se não houver)
+    latest_job = (
+        db.query(JobModel)
+        .filter(JobModel.project_id == project_id)
+        .order_by(JobModel.created_at.desc())
+        .first()
+    )
+    if latest_job:
+        try:
+            current_files = json.loads(latest_job.result_files_json or "[]")
+            if not isinstance(current_files, list):
+                current_files = []
+        except Exception:
+            current_files = []
+        if rel_target_path not in current_files:
+            current_files.append(rel_target_path)
+            latest_job.result_files_json = json.dumps(current_files)
+            db.commit()
+
+    return {
+        "project_id": project_id,
+        "format": target_fmt,
+        "filename": target_filename,
+        "relative_path": rel_target_path,
+        "download_url": f"/api/v1/projects/{project_id}/artifacts/{target_filename}",
+        "file_size_bytes": export_meta.get("file_size_bytes", 0),
+        "validated": True,
+    }
 
 @router.get("/projects/{project_id}/artifacts/{filename}")
 def download_artifact(project_id: str, filename: str, db: Session = Depends(get_db)):

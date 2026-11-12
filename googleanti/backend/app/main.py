@@ -302,24 +302,30 @@ def reconcile_interrupted_jobs():
     # Limpar quaisquer arquivos temporários parciais (.tmp.*) nos projetos afetados ou em STORAGE_DIR
     try:
         storage_root = settings.STORAGE_DIR.resolve()
-        if storage_root.exists() and storage_root.is_dir():
+        if storage_root.exists() and storage_root.is_dir() and not storage_root.is_symlink():
             for proj_dir in storage_root.iterdir():
-                if proj_dir.is_dir() and proj_dir.name != settings.QUARANTINE_DIR.name:
-                    JobOrchestrator._cleanup_partial_files(proj_dir.name)
+                if proj_dir.is_dir() and not proj_dir.is_symlink() and proj_dir.name != settings.QUARANTINE_DIR.name:
+                    JobOrchestrator._cleanup_partial_files(proj_dir.name, sweep_all_tmp=True)
     except Exception as clean_err:
         logger.warning(f"Erro ao limpar arquivos temporários parciais na reconciliação de jobs: {clean_err}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+    # Registrar event loop principal para despacho assíncrono não-bloqueante (Achado B)
+    JobOrchestrator.set_main_loop(asyncio.get_running_loop())
     # Inicialização do banco e tabelas
     init_db()
     # Reconciliação de arquivos e armazenamento (Bloco 1)
     reconcile_storage_and_quarantine()
     # Reconciliação de tarefas interrompidas por reinício do servidor (Bloco 2 - Task 2.3)
     reconcile_interrupted_jobs()
-    yield
-    # Encerramento limpo e cooperativo de jobs em execução no shutdown (Bloco 2 - Task 2.1)
-    await JobOrchestrator.shutdown_active_jobs()
+    try:
+        yield
+    finally:
+        # Encerramento limpo e cooperativo de jobs em execução no shutdown (Bloco 2 - Task 2.1)
+        await JobOrchestrator.shutdown_active_jobs()
+        JobOrchestrator.set_main_loop(None)
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

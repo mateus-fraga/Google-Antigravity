@@ -600,3 +600,155 @@ Resultados dos comandos executados:
 ### 5. Riscos Residuais e Limitações Conhecidas
 1. **Granularidade dos Checkpoints Cooperativos em Chamadas C/C++ Nativas:** Como Python não permite matar preemptivamente uma worker thread sem corromper o interpretador, se uma única chamada atômica de biblioteca nativa (ex: booleana complexa no Shapely/Trimesh) levar alguns milissegundos, o cancelamento cooperativo aguarda o retorno imediato daquela função para abortar no checkpoint seguinte e descartar temporários.
 2. **Escopo dos Próximos Blocos:** A validação estrita de parâmetros finitos e orientação geométrica Y-up pertencem ao **Bloco 3 (Tarefas 3.1 a 3.4)**; o descarte WebGL e o botão de cancelamento na interface React pertencem ao **Bloco 4 (Tarefas 4.1 a 4.4)**. Nenhum desses blocos foi iniciado.
+
+---
+
+## Entrada 7 — Correção Cirúrgica de Concorrência HTTP, Isolamento de Temporários por Job e Posse de Descritor (Blocos 1 e 2)
+- **Data:** 2026-11-11
+- **Mudança OpenSpec:** `stabilize-ai-3d-studio-mvp`
+- **Escopo:** Correção cirúrgica complementar dos Blocos 1 e 2 (Achados A, B, C e D)
+- **Status:** Implementado, Testado e Validado (`43 passed`)
+
+---
+
+### 1. Problemas Identificados na Auditoria Técnica Complementar
+
+1. **Achado A — Duplo fechamento potencial de descritor em `_stream_from_verified_fd(fd)` (`backend/app/api/routes.py`):**
+   - **Causa:** `os.fdopen(fd, "rb", closefd=True)` assume a propriedade do descritor `fd` e o fecha automaticamente ao sair do bloco `with`. Contudo, o bloco `finally` subsequente invocava `os.close(fd)` novamente, engolindo `OSError`. Em um servidor concorrente, se o sistema operacional reutilizasse o mesmo número inteiro de descritor `fd` imediatamente após o fechamento do `with`, o `os.close(fd)` no `finally` poderia fechar indevidamente um descritor recém-alocado por outra requisição ou thread.
+2. **Achado B — Despacho de jobs bloqueante na requisição HTTP `POST /api/v1/jobs` (`backend/app/api/routes.py`, `backend/app/jobs/orchestrator.py` e `backend/app/main.py`):**
+   - **Causa:** O endpoint `create_job` era síncrono (`def`) e `JobOrchestrator.dispatch_job()` caía no ramo `except RuntimeError` (ausência de event loop na worker thread do endpoint síncrono), executando `asyncio.run(...)` de forma bloqueante até o término completo da geração 3D. Além disso, cada chamada de `asyncio.run(...)` criava um event loop isolado, fragmentando o `asyncio.Semaphore(MAX_CONCURRENT_JOBS)`.
+3. **Achado C — Colisão na limpeza de arquivos `.tmp` entre jobs concorrentes do mesmo projeto (`backend/app/jobs/orchestrator.py` e `backend/app/exporters/mesh_exporter.py`):**
+   - **Causa:** `_cleanup_partial_files(project_id)` varria e removia indistintamente qualquer arquivo contendo `.tmp.` no diretório do projeto. Caso dois jobs do mesmo projeto estivessem em execução simultânea e o Job 1 fosse cancelado ou falhasse enquanto o Job 2 escrevia seu `.tmp.glb` antes do `os.replace`, o cleanup do Job 1 apagaria o temporário ativo do Job 2.
+4. **Achado D — Verificação explícita contra symlinks de diretórios na reconciliação de startup (`backend/app/main.py`):**
+   - **Causa:** No final de `reconcile_interrupted_jobs()`, a varredura de diretórios em `STORAGE_DIR` verificava `proj_dir.is_dir()`, mas não incluía a guarda explícita `and not proj_dir.is_symlink()` antes de invocar `_cleanup_partial_files`.
+
+---
+
+### 2. Correções Implementadas por Arquivo
+
+| Arquivo | Funções / Métodos Alterados | Descrição Técnica da Mudança |
+| :--- | :--- | :--- |
+| `backend/app/api/routes.py` | `_stream_from_verified_fd`, `create_job`, `get_job`, `cancel_job` | **Achado A:** Adicionada flag `fd_owned_by_fileobj = False` antes de `os.fdopen(fd, "rb", closefd=True)` e `fd_owned_by_fileobj = True` assim que o objeto de arquivo assume a posse do descritor; o bloco `finally` só executa `os.close(fd)` se `not fd_owned_by_fileobj` (ex.: falha antes de `os.fdopen` concluir). **Achado B:** Endpoints `create_job`, `get_job` e `cancel_job` convertidos para `async def` no event loop principal do FastAPI, garantindo retorno HTTP `200 OK` imediato no `POST /api/v1/jobs` e compartilhamento de um único semáforo global. |
+| `backend/app/jobs/orchestrator.py` | `set_main_loop`, `_ensure_background_loop`, `dispatch_job`, `cancel_job`, `run_procedural_job_async`, `_cleanup_partial_files` | **Achado B:** Adicionado registro do event loop principal da aplicação (`set_main_loop`) e fallback seguro para loop persistente em background (`_ensure_background_loop`) quando invocado fora de contexto `lifespan`, eliminando `asyncio.run(...)` bloqueante em `dispatch_job` e suportando cancelamento thread-safe entre loops (`call_soon_threadsafe`). **Achado C:** `_cleanup_partial_files` agora recebe `job_id` e `sweep_all_tmp: bool = False`; em tempo de execução, remove apenas `candidate_paths` do próprio job e arquivos temporários cujo nome contenha `_{job_id}_`. A varredura ampla (`sweep_all_tmp=True`) fica restrita exclusivamente ao startup (`reconcile_interrupted_jobs`). |
+| `backend/app/exporters/mesh_exporter.py` | `ModelExporter.export_and_validate` | **Achado C:** Adicionado parâmetro opcional `job_id: Optional[str] = None`. Quando informado pelo `JobOrchestrator`, o arquivo temporário intermediário é nomeado como `.{output_path.stem}_{job_id}_{tmp_suffix}.tmp.{fmt}`, vinculando univocamente cada arquivo `.tmp` ao `job_id` que o criou. |
+| `backend/app/main.py` | `reconcile_interrupted_jobs`, `lifespan` | **Achado B:** Registrado o event loop principal no `lifespan` via `JobOrchestrator.set_main_loop(asyncio.get_running_loop())`. **Achados C e D:** Na reconciliação de startup (`reconcile_interrupted_jobs`), adicionadas verificações `not storage_root.is_symlink()` e `not proj_dir.is_symlink()` e ativado `sweep_all_tmp=True` para limpeza segura de temporários órfãos de processos anteriores. |
+| `backend/tests/test_security.py` | `test_stream_from_verified_fd_closes_descriptor_only_once` | Novo teste automatizado que intercepta `os.close` e comprova que o consumo normal de `_stream_from_verified_fd(fd)` fecha o descritor via `os.fdopen` sem chamar `os.close(fd)` redundantemente no `finally`, enquanto uma falha antes de `os.fdopen` aciona `os.close(fd)` exatamente uma vez. |
+| `backend/tests/test_recovery.py` | `test_http_post_jobs_non_blocking_and_observable_running_state`, `test_concurrent_jobs_same_project_isolated_temp_files_on_cancel` | Novos testes automatizados comprovando: (1) que `POST /api/v1/jobs` retorna `200 OK` imediatamente enquanto o worker está bloqueado em um `threading.Event` e `GET /api/v1/jobs/{id}` observa o job em `Preparando`/`Em Execução` antes da liberação da barreira; e (2) que o cancelamento do Job 1 não remove o arquivo `.tmp.glb` ativo do Job 2 concorrente no mesmo projeto. |
+
+---
+
+### 3. Comandos Executados e Resultados Reais
+
+1. **Suíte de Segurança (Bloco 1 + Achado A):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests\test_security.py -vv`
+   - Resultado: **19 aprovados (`19 passed`), 0 falhas** em `4.54s`.
+2. **Suíte de Concorrência, Cancelamento e Recuperação (Bloco 2 + Achados B, C e D):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests\test_recovery.py -vv`
+   - Resultado: **8 aprovados (`8 passed`), 0 falhas** em `3.79s`.
+3. **Suíte Completa de Testes do Backend (Regressão Geral):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests -v`
+   - Resultado: **43 aprovados (`43 passed`), 0 falhas** em `5.30s`.
+4. **Validação Estrita OpenSpec:**
+   - Comando: `openspec validate --strict stabilize-ai-3d-studio-mvp`
+   - Resultado: **`Change 'stabilize-ai-3d-studio-mvp' is valid`** (`0` erros).
+
+---
+
+## Entrada 8 — Implementação e Validação do Bloco 3 — Validação Paramétrica, Alinhamento Geométrico Y-up e Compatibilidade (R3 / GEO-001)
+- **Data:** 2026-11-12
+- **Mudança OpenSpec:** `stabilize-ai-3d-studio-mvp`
+- **Escopo:** Bloco 3 — Tarefas 3.1, 3.2, 3.3 e 3.4
+- **Status:** Implementado, Testado e Validado (`61 passed`)
+
+---
+
+### 1. Diagnóstico Inicial (Pré-Implementação do Bloco 3)
+
+1. **Validação Paramétrica (`geometry.py`, `jobs.py`, `engine.py`):**
+   - Anteriormente, `ProceduralParams.dimensions` (`Dict[str, float]`) e `JobCreate.params` (`Dict[str, Any]`) não possuíam validadores para rejeitar `NaN`, `Infinity`, `-Infinity`, valores `<= 0` ou booleanos (`True`/`False` aceitos como `1`/`0` em Python). No motor `ProceduralGenerator`, `max(0.01, float(val))` mascarava entradas negativas/zero ou deixava `NaN` propagar silenciosamente até o Trimesh.
+2. **Eixo Vertical e Orientação Geométrica (`engine.py`):**
+   - Todas as primitivas (`create_box`, `create_cylinder`, `create_gear`, `create_table`) eram construídas no espaço Z-up (plano de base XY e altura/extrusão ao longo de Z com `mesh.apply_translation([0, 0, height / 2.0])`), divergindo da convenção **Y-up** (altura em Y, plano de solo XZ em $Y = 0$) adotada pelo glTF 2.0 e pelo Three.js.
+   - Em `create_gear`, `extrude_polygon(polygon, height=height)` já gera a malha de $Z = 0$ a $Z = height$, mas recebia uma translação adicional `height / 2.0`, deslocando a base para $height / 2.0$.
+3. **Compatibilidade Retroativa Z-up / Y-up e Round-Trip (`jobs.py`, `orchestrator.py`, `mesh_exporter.py`):**
+   - Não havia metadado explícito (`coordinate_system`, `geometry_schema_version`) persistido nos projetos/jobs nem verificação no `ModelExporter.export_and_validate()` para atestar preservação dos `extents` e `bounds` após reimportação em GLB, OBJ e STL.
+
+---
+
+### 2. Alterações Implementadas por Tarefa e Arquivo
+
+| Tarefa | Arquivo(s) | Funções / Classes Alteradas | Descrição Técnica |
+| :--- | :--- | :--- | :--- |
+| **3.1** | `backend/app/schemas/geometry.py`, `backend/app/schemas/jobs.py` | `_ensure_finite_number`, `_ensure_strict_int`, `validate_procedural_parameters_dict`, `Transformation`, `MaterialDef`, `Component`, `IntermediateObjectRepresentation`, `ProceduralParams`, `JobCreate` | Rejeição determinística de `NaN`, `Infinity`, `-Infinity`, booleanos (`isinstance(v, bool)`), dimensões `<= 0` e formas desconhecidas. Aplicação de limites de domínio (`MIN_DIMENSION = 1e-4`, `MAX_DIMENSION = 1000.0`, `sections/subdivisions` em `[4, 256]`, `num_teeth` em `[4, 128]`) e restrições relacionais (`inner_radius < outer_radius`, `bore_radius < inner_radius`, `top_thickness < height`, `2 * leg_thickness < min(width, depth)`), retornando HTTP 422 na entrada da API. |
+| **3.2** | `backend/app/procedural/engine.py` | `_Z_UP_TO_Y_UP_MATRIX`, `_finalize_and_verify_mesh`, `create_box`, `create_cylinder`, `create_gear`, `create_table`, `create_sphere`, `create_cone`, `create_torus`, `generate_by_params`, `inspect_mesh` | Padronização nativa em **Y-up** (eixo X = largura, eixo Y = altura vertical com base apoiada no plano XZ em $Y = 0.0$ e topo em $Y = height$, eixo Z = profundidade). Rotação ortonormal própria ($\det = +1$) de $-90^\circ$ em X para primitivas geradas em Z no Trimesh (`cylinder`, `gear`, `sphere`, `cone`, `torus`), reparo/verificação de winding e normais externas, remoção de faces degeneradas e enriquecimento de `inspect_mesh()` com `bounds`, `extents`, `coordinate_system: "Y-up"` e `geometry_schema_version: 2`. |
+| **3.3** | `backend/app/procedural/engine.py`, `backend/app/schemas/jobs.py`, `backend/app/jobs/orchestrator.py`, `backend/app/exporters/mesh_exporter.py` | `resolve_coordinate_metadata`, `normalize_legacy_mesh_to_y_up`, `ProjectResponse.extract_coordinate_metadata`, `JobOrchestrator.run_procedural_job_async`, `ModelExporter.export_and_validate` | Persistência de `coordinate_system: "Y-up"` e `geometry_schema_version: 2` nos metadados do job e em `ProjectModel.parameters_json`. Projetos anteriores com `active_model_path` sem flag `coordinate_system` são identificados como `legacy_z_up` (`geometry_schema_version = 1`), e `normalize_legacy_mesh_to_y_up` garante conversão idempotente sem dupla rotação. `ModelExporter.export_and_validate()` agora valida `np.allclose` em `extents` e `bounds` no round-trip de GLB, OBJ e STL. |
+| **3.4** | `backend/tests/test_coordinates.py`, `backend/tests/test_schemas.py`, `backend/tests/test_procedural.py`, `backend/tests/test_exporters.py` | Suíte de testes unitários e de integração geométrica | Criação de `backend/tests/test_coordinates.py` e ampliação de `test_schemas.py`, `test_procedural.py` e `test_exporters.py` cobrindo rejeição de `NaN`/`Inf`/negativos/limites, bounding boxes de objetos assimétricos em Y-up, orientação de normais externas, round-trip GLB/OBJ/STL e compatibilidade retroativa `legacy_z_up` sem dupla conversão. |
+
+---
+
+### 3. Comandos Executados e Resultados Reais
+
+1. **Testes Geométricos, Schemas, Coordenadas e Exportação (Bloco 3):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests\test_schemas.py backend\tests\test_procedural.py backend\tests\test_exporters.py backend\tests\test_coordinates.py -vv`
+   - Resultado: **28 aprovados (`28 passed`), 0 falhas** em `15.85s`.
+2. **Suíte Completa do Backend (Regressão Blocos 1, 2 e 3):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests -v`
+   - Resultado: **61 aprovados (`61 passed`), 0 falhas** em `6.39s`.
+3. **Build de Produção do Frontend:**
+   - Comando: `cd frontend && npm run build`
+   - Resultado: **Sucesso (`✓ built in 1.96s`)**, `0` erros TypeScript.
+4. **Validação Estrita OpenSpec:**
+   - Comando: `openspec validate --strict stabilize-ai-3d-studio-mvp`
+   - Resultado: **`Change 'stabilize-ai-3d-studio-mvp' is valid`** (`0` erros).
+
+---
+
+## Entrada 9 — Implementação e Validação do Bloco 4 — Visualizador Three.js, Ciclo de Vida WebGL e Interface do Usuário (R4, R6 / MEM-001, UI-001)
+- **Data:** 2026-11-12
+- **Mudança OpenSpec:** `stabilize-ai-3d-studio-mvp`
+- **Escopo:** Bloco 4 — Tarefas 4.1, 4.2, 4.3 e 4.4
+- **Status:** Implementado, Testado e Validado (`62 passed`, Frontend Build `0` erros TS)
+
+---
+
+### 1. Diagnóstico Inicial (Pré-Implementação do Bloco 4)
+
+1. **Ciclo de Vida WebGL e Descarte de Recursos (`ThreeViewer.ts` / `ModelViewer.tsx`):**
+   - Ao substituir um modelo 3D em `loadModelFromUrl()`, o código anterior apenas removia os objetos do `currentMeshGroup` (`this.currentMeshGroup.remove(obj)`), sem invocar `geometry.dispose()`, `material.dispose()` ou descartar mapas de textura, causando vazamento cumulativo de memória na GPU (`MEM-001`).
+   - Não havia proteção contra condições de corrida (`loadRequestId`) caso o usuário trocasse de projeto/modelo rapidamente antes da conclusão de um carregamento assíncrono anterior.
+2. **Orientação Y-up, Indicador de Eixos e Vistas Predefinidas (`ThreeViewer.ts` / `GenerationPanel.tsx`):**
+   - `ThreeViewer.ts` exibia apenas um `AxesHelper` simples sem rótulos visuais (`X`, `Y (Cima)`, `Z`), possuía apenas 4 vistas (`front`, `top`, `side`, `iso`), e não diferenciava projetos legados (`legacy_z_up`) de modelos nativos `Y-up`.
+   - Em `GenerationPanel.tsx`, os rótulos do formulário de caixa ainda exibiam `"Altura (Z)"` e `"Profundidade (Y)"`.
+3. **Download Contextual Seguro, Exportação Multiformato e Cancelamento na UI (`api.ts` / `App.tsx`):**
+   - `api.ts` e `App.tsx` utilizavam a rota legada `/api/v1/files/download?path=...` em vez da rota contextual segura `/api/v1/projects/{project_id}/artifacts/{filename}`.
+   - A interface permitia apenas o download estático do arquivo `.glb`, sem seletor para `.obj` e `.stl` e sem botão funcional de cancelamento de tarefas em execução (`POST /api/v1/jobs/{job_id}/cancel`).
+
+---
+
+### 2. Alterações Implementadas por Tarefa e Arquivo
+
+| Tarefa | Arquivo(s) | Funções / Componentes Alterados | Descrição Técnica |
+| :--- | :--- | :--- | :--- |
+| **4.1** | `frontend/src/viewer/ThreeViewer.ts`, `frontend/src/viewer/ModelViewer.tsx` | `disposeHierarchy`, `clearCurrentModel`, `loadModelFromUrl`, `destroy` | Implementado descarte recursivo de `BufferGeometry`, `Material` (único ou array) e 12 tipos de mapas de textura (`map`, `normalMap`, `roughnessMap`, `metalnessMap`, etc.). Proteção explícita de ownership (`userData.permanentHelper = true`) para preservar a grade XZ, os eixos Y-up e as luzes durante trocas de modelo, descartando-os apenas no `destroy()` definitivo. Adicionado controle `loadRequestId` contra condições de corrida em carregamentos concorrentes e tratamento seguro de erros WebGL/GLTF em português brasileiro. |
+| **4.2** | `frontend/src/viewer/ThreeViewer.ts`, `frontend/src/features/generation/GenerationPanel.tsx` | `createLabeledAxesGroup`, `fitCameraToCurrentModel`, `setView`, `toggleAxes` | Grade posicionada no plano de solo XZ ($Y = 0$), indicador de eixos Y-up com rótulos visuais (`X` vermelho, `Y (Cima)` verde, `Z` azul), 7 vistas predefinidas (`front`, `back`, `left`, `right`, `top`, `bottom`, `iso`), suporte à normalização visual única para modelos `legacy_z_up` (sem dupla rotação em modelos `Y-up`) e extração de telemetria real (`vertexCount`, `faceCount`, `dimensions`, `boundsMin`, `boundsMax`). Rótulos de `GenerationPanel.tsx` alinhados para `Largura X`, `Altura Y` e `Profundidade Z`. |
+| **4.3** | `frontend/src/App.tsx`, `frontend/src/features/generation/GenerationPanel.tsx`, `backend/app/api/routes.py` | `list_project_artifacts`, `export_project_model_format`, `handleExportAndDownload`, `handleCancelActiveJob` | Adicionado seletor multiformato (**GLB**, **OBJ**, **STL**) na interface com verificação dos artefatos disponíveis no projeto (`GET /api/v1/projects/{id}/artifacts`) e geração/validação sob demanda (`POST /api/v1/projects/{id}/export/{fmt}`) via `ModelExporter.export_and_validate`. Adicionado botão funcional **Cancelar Tarefa em Execução** durante o processamento e exibição estruturada de erros em português brasileiro. |
+| **4.4** | `frontend/src/services/api.ts`, `backend/tests/test_exporters.py` | `getArtifactDownloadUrl`, `listProjectArtifacts`, `exportProjectModelFormat`, `parseApiError`, `test_contextual_multiformat_export_and_secure_download_api` | Migração do consumo de artefatos no frontend para o endpoint contextual seguro `/api/v1/projects/{project_id}/artifacts/{filename}`, extração legível de mensagens de erro Pydantic/FastAPI (incluindo HTTP 422 do Bloco 3) e criação de teste de integração validando a exportação e download seguro nos 3 formatos (`glb`, `obj`, `stl`). |
+
+---
+
+### 3. Comandos Executados e Resultados Reais
+
+1. **Build de Produção e Verificação de Tipos do Frontend:**
+   - Comando: `cd frontend && npm run build`
+   - Resultado: **Sucesso (`✓ built in 1.37s`)**, `0` erros TypeScript (`tsc -b && vite build`).
+2. **Linter do Frontend:**
+   - Comando: `cd frontend && npm run lint`
+   - Resultado: **`0` erros** (`Found 2 warnings and 0 errors`).
+3. **Suíte Completa do Backend (Regressão Blocos 1, 2, 3 + Contratos do Bloco 4):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend\tests -v`
+   - Resultado: **62 aprovados (`62 passed`), 0 falhas** em `9.26s`.
+4. **Validação Estrita OpenSpec:**
+   - Comando: `openspec validate --strict stabilize-ai-3d-studio-mvp`
+   - Resultado: **`Change 'stabilize-ai-3d-studio-mvp' is valid`** (`0` erros).
+
+
+

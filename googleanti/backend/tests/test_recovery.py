@@ -278,20 +278,20 @@ async def test_cooperative_cancellation_during_generation_and_export_cleans_part
     # --- Fase 2: Cancelamento no meio da exportação (com arquivo .tmp.glb em disco) ---
     monkeypatch.setattr(ProceduralGenerator, "generate_by_params", orig_gen)
 
-    # Criar um arquivo temporário parcial simulado na pasta do projeto e cancelar no checkpoint do exporter
-    partial_tmp = proj_dir / ".cylinder_partial.tmp.glb"
+    # Criar um arquivo temporário parcial simulado associado ao job2_id na pasta do projeto e cancelar no checkpoint do exporter
+    partial_tmp = proj_dir / f".cylinder_{job2_id}_partial.tmp.glb"
     partial_tmp.write_bytes(b"PARTIAL_UNVALIDATED_BYTES")
 
     orig_export = ModelExporter.export_and_validate
-    def cancel_inside_exporter(cls_or_mesh, output_path, fmt="glb", cancel_check=None):
+    def cancel_inside_exporter(cls_or_mesh, output_path, fmt="glb", cancel_check=None, job_id=None):
         # Disparar o cancelamento exatamente durante a exportação antes do último cancel_check
         JobOrchestrator.cancel_job(job2_id)
-        return orig_export(cls_or_mesh, output_path, fmt=fmt, cancel_check=cancel_check)
+        return orig_export(cls_or_mesh, output_path, fmt=fmt, cancel_check=cancel_check, job_id=job_id)
 
     monkeypatch.setattr(ModelExporter, "export_and_validate", cancel_inside_exporter)
     await JobOrchestrator.run_procedural_job_async(job2_id, "proj-cancel", {"shape_type": "cylinder"})
 
-    # O arquivo temporário parcial e qualquer novo .glb não validado devem ter sido removidos!
+    # O arquivo temporário parcial do job2 e qualquer novo .glb não validado devem ter sido removidos!
     assert not partial_tmp.exists()
     remaining_files = [p.name for p in proj_dir.iterdir()]
     assert remaining_files == ["previous_valid.glb"]
@@ -442,3 +442,164 @@ async def test_project_deletion_while_job_running_in_threadpool_prevents_resurre
 
     # A pasta do projeto NÃO pode ter sido recriada pela worker thread!
     assert not (settings.STORAGE_DIR / proj_id).exists()
+
+
+def test_http_post_jobs_non_blocking_and_observable_running_state(isolated_recovery_env, monkeypatch):
+    """
+    Achado B (Despacho Assíncrono Real no Endpoint HTTP):
+    Verifica que uma chamada HTTP real `POST /api/v1/jobs`:
+    1. Retorna `200 OK` imediatamente (em estado inicial `Pendente`, `Preparando` ou `Em Execução`)
+       SEM aguardar o término da geração procedural quando a worker thread está retida em uma barreira.
+    2. Permite que uma chamada HTTP subsequente `GET /api/v1/jobs/{job_id}` observe o job em andamento
+       (`Preparando` ou `Em Execução`) enquanto a barreira está fechada.
+    3. Conclui normalmente (`Concluída`) após a liberação da barreira.
+    """
+    res_proj = client.post("/api/v1/projects", json={"name": "HTTP Non-Blocking Dispatch Project"})
+    assert res_proj.status_code == 200
+    proj_id = res_proj.json()["id"]
+
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    orig_gen = ProceduralGenerator.generate_by_params
+
+    def barrier_generate(shape_type, params):
+        worker_entered.set()
+        release_worker.wait(timeout=5.0)
+        return orig_gen(shape_type, params)
+
+    monkeypatch.setattr(ProceduralGenerator, "generate_by_params", barrier_generate)
+
+    # 1. Disparar o job via endpoint HTTP POST /api/v1/jobs: deve retornar imediatamente sem bloquear na barreira!
+    post_res = client.post(
+        "/api/v1/jobs",
+        json={
+            "project_id": proj_id,
+            "operation_type": "procedural_generation",
+            "parameters": {"shape_type": "box", "width": 10.0}
+        }
+    )
+    assert post_res.status_code == 200
+    post_data = post_res.json()
+    job_id = post_data["id"]
+    assert post_data["status"] in (
+        JobStatus.PENDING.value,
+        JobStatus.PREPARING.value,
+        JobStatus.RUNNING.value,
+    )
+
+    # Aguardar até que a worker thread efetivamente entre na geração (comprovando execução em background)
+    assert worker_entered.wait(timeout=3.0) is True
+
+    # 2. Consultar GET /api/v1/jobs/{job_id} enquanto a barreira permanece fechada:
+    # deve responder imediatamente com estado intermediário ('Preparando' ou 'Em Execução')
+    get_running_res = client.get(f"/api/v1/jobs/{job_id}")
+    assert get_running_res.status_code == 200
+    running_status = get_running_res.json()["status"]
+    assert running_status in (JobStatus.PREPARING.value, JobStatus.RUNNING.value)
+
+    # 3. Liberar a barreira e verificar que o job atinge o estado 'Concluída'
+    release_worker.set()
+
+    final_status = None
+    for _ in range(30):
+        get_done_res = client.get(f"/api/v1/jobs/{job_id}")
+        assert get_done_res.status_code == 200
+        final_status = get_done_res.json()["status"]
+        if final_status == JobStatus.COMPLETED.value:
+            break
+    assert final_status == JobStatus.COMPLETED.value
+
+
+@pytest.mark.anyio
+async def test_concurrent_jobs_same_project_isolated_temp_files_on_cancel(isolated_recovery_env, monkeypatch):
+    """
+    Achado C (Isolamento de Temporários entre Jobs Concorrentes do Mesmo Projeto):
+    Quando dois jobs (Job 1 e Job 2) do mesmo projeto executam simultaneamente:
+    - O Job 2 está no meio da exportação e já escreveu seu arquivo temporário `.{stem}_{job2_id}_{suffix}.tmp.glb`
+      no disco, aguardando antes do `os.replace`.
+    - O Job 1 também possui um arquivo temporário `.{stem}_{job1_id}_{suffix}.tmp.glb` no mesmo diretório e é cancelado.
+    - A limpeza de arquivos parciais do Job 1 remove EXCLUSIVAMENTE o temporário do Job 1,
+      preservando intacto o temporário do Job 2 para que o Job 2 conclua com sucesso (`Concluída`).
+    """
+    SessionLocal = isolated_recovery_env
+    db = SessionLocal()
+    proj_id = "proj-concurrent-tmp"
+    proj = ProjectModel(id=proj_id, name="Concurrent Temp Isolation Project", status="active")
+    db.add(proj)
+    db.commit()
+
+    job1 = JobOrchestrator.create_job(db, proj_id, "procedural_generation", {"shape_type": "box"})
+    job1_id = job1.id
+    job2 = JobOrchestrator.create_job(db, proj_id, "procedural_generation", {"shape_type": "cylinder"})
+    job2_id = job2.id
+    db.close()
+
+    proj_dir = settings.STORAGE_DIR / proj_id
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    # Simular que o Job 1 criou um temporário próprio antes de ser cancelado
+    job1_tmp = proj_dir / f".box_{job1_id}_ab12cd34.tmp.glb"
+    job1_tmp.write_bytes(b"JOB1_PARTIAL_TMP_BYTES")
+
+    job1_in_gen = threading.Event()
+    job1_resume = threading.Event()
+    job2_tmp_written = threading.Event()
+    job2_allow_replace = threading.Event()
+    observed_job2_tmp_paths = []
+
+    orig_gen = ProceduralGenerator.generate_by_params
+    def hooked_gen(shape_type, params):
+        if shape_type == "box":
+            job1_in_gen.set()
+            job1_resume.wait(timeout=5.0)
+        return orig_gen(shape_type, params)
+
+    orig_replace = os.replace
+    def hooked_replace(src, dst):
+        src_str = str(src)
+        if f"_{job2_id}_" in src_str and ".tmp." in src_str:
+            observed_job2_tmp_paths.append(Path(src_str))
+            job2_tmp_written.set()
+            # Segurar o Job 2 exatamente com seu arquivo .tmp.glb já escrito e validado no disco,
+            # antes da promoção atômica (`os.replace`), enquanto o Job 1 é cancelado e limpa seus parciais!
+            job2_allow_replace.wait(timeout=5.0)
+        return orig_replace(src, dst)
+
+    monkeypatch.setattr(ProceduralGenerator, "generate_by_params", hooked_gen)
+    monkeypatch.setattr(os, "replace", hooked_replace)
+
+    task1 = asyncio.create_task(JobOrchestrator.run_procedural_job_async(job1_id, proj_id, {"shape_type": "box"}))
+    task2 = asyncio.create_task(JobOrchestrator.run_procedural_job_async(job2_id, proj_id, {"shape_type": "cylinder"}))
+
+    while not (job1_in_gen.is_set() and job2_tmp_written.is_set()):
+        await asyncio.sleep(0.005)
+
+    # Comprovar que ambos os temporários (.tmp do Job 1 e .tmp do Job 2) existem simultaneamente no diretório do projeto
+    assert job1_tmp.exists()
+    assert len(observed_job2_tmp_paths) == 1
+    job2_tmp = observed_job2_tmp_paths[0]
+    assert job2_tmp.exists()
+
+    # Cancelar o Job 1 e aguardar que ele execute sua rotina `_cleanup_partial_files(..., job_id=job1_id)`
+    assert JobOrchestrator.cancel_job(job1_id) is True
+    job1_resume.set()
+    await task1
+
+    # O temporário do Job 1 DEVE ter sido removido, mas o temporário do Job 2 DEVE permanecer intacto!
+    assert not job1_tmp.exists()
+    assert job2_tmp.exists()
+
+    # Liberar o Job 2 para concluir o `os.replace`
+    job2_allow_replace.set()
+    await task2
+
+    db = SessionLocal()
+    j1_db = db.query(JobModel).filter(JobModel.id == job1_id).first()
+    j2_db = db.query(JobModel).filter(JobModel.id == job2_id).first()
+    assert j1_db.status == JobStatus.CANCELLED.value
+    assert j2_db.status == JobStatus.COMPLETED.value
+    j2_files = json.loads(j2_db.result_files_json)
+    assert len(j2_files) == 1
+    assert (settings.BASE_DIR / j2_files[0]).exists()
+    db.close()
+

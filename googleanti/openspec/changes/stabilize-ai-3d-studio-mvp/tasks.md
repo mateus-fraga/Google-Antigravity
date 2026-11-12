@@ -16,17 +16,17 @@
 
 ## 3. Validação Paramétrica, Alinhamento Y-up e Compatibilidade (R3 / GEO-001)
 
-- [ ] 3.1 Reforçar validação de limites e tipos nos schemas `ProceduralParams` e `IntermediateObjectRepresentation` (Pydantic V2) rejeitando dimensões $\le 0$, valores não finitos, infinitos e NaN
-- [ ] 3.2 Adequar todas as primitivas procedurais (`create_box`, `create_cylinder`, `create_gear`, `create_table`) em `backend/app/procedural/engine.py` para convenção Y-up nativa (assentamento no solo XZ em $Y=0$ com altura positiva em Y e normais externas corretas)
-- [ ] 3.3 Implementar suporte a metadado de orientação nos projetos para identificar modelos legados Z-up e prevenir dupla conversão no carregamento
-- [ ] 3.4 Atualizar testes existentes e criar `backend/tests/test_coordinates.py` validando bounding boxes, normais orientadas, malhas assimétricas e conformidade Y-up
+- [x] 3.1 Reforçar validação de limites e tipos nos schemas `ProceduralParams` e `IntermediateObjectRepresentation` (Pydantic V2) rejeitando dimensões $\le 0$, valores não finitos, infinitos e NaN
+- [x] 3.2 Adequar todas as primitivas procedurais (`create_box`, `create_cylinder`, `create_gear`, `create_table`) em `backend/app/procedural/engine.py` para convenção Y-up nativa (assentamento no solo XZ em $Y=0$ com altura positiva em Y e normais externas corretas)
+- [x] 3.3 Implementar suporte a metadado de orientação nos projetos para identificar modelos legados Z-up e prevenir dupla conversão no carregamento
+- [x] 3.4 Atualizar testes existentes e criar `backend/tests/test_coordinates.py` validando bounding boxes, normais orientadas, malhas assimétricas e conformidade Y-up
 
 ## 4. Visualizador Three.js e Interface do Usuário (R4, R6 / MEM-001, UI-001)
 
-- [ ] 4.1 Implementar método recursivo de descarte profundo (`disposeHierarchy`) em `frontend/src/viewer/ThreeViewer.ts` liberando geometrias, materiais e texturas ao substituir modelos ou desmontar componente
-- [ ] 4.2 Adicionar indicador de eixos orientados com convenção Y-up visível e grade no plano de solo XZ no `ThreeViewer.ts`
-- [ ] 4.3 Adicionar seletor de exportação multiformato (GLB, OBJ, STL) com verificação de artefatos disponíveis e botão de cancelamento de tarefa na interface em `frontend/src/App.tsx`
-- [ ] 4.4 Atualizar `frontend/src/services/api.ts` para consumir o novo endpoint contextual seguro de artefatos e suporte a cancelamento de tarefas
+- [x] 4.1 Implementar método recursivo de descarte profundo (`disposeHierarchy`) em `frontend/src/viewer/ThreeViewer.ts` liberando geometrias, materiais e texturas ao substituir modelos ou desmontar componente
+- [x] 4.2 Adicionar indicador de eixos orientados com convenção Y-up visível e grade no plano de solo XZ no `ThreeViewer.ts`
+- [x] 4.3 Adicionar seletor de exportação multiformato (GLB, OBJ, STL) com verificação de artefatos disponíveis e botão de cancelamento de tarefa na interface em `frontend/src/App.tsx`
+- [x] 4.4 Atualizar `frontend/src/services/api.ts` para consumir o novo endpoint contextual seguro de artefatos e suporte a cancelamento de tarefas
 
 ## 5. Verificação Completa e Integração Contínua (R4, R6)
 

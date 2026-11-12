@@ -32,7 +32,34 @@ googleanti/
 - Sistema operacional Windows (conforme ambiente atual)
 
 ## Configuração e execução
-### Backend
+
+### Inicialização Rápida (Comando Único — Recomendado)
+Para iniciar simultaneamente o **Backend (FastAPI na porta 8000)** e o **Frontend (Vite na porta 5173)** com verificação e instalação automática de `backend/venv` e `frontend/node_modules`:
+
+**Windows (PowerShell, CMD ou duplo clique no Explorer):**
+```powershell
+cd googleanti
+.\execs\start_dev.bat
+```
+*(Também disponível em `.\scripts\start_dev.bat`.)*
+
+**Linux / macOS / Git Bash:**
+```bash
+cd googleanti
+chmod +x ./execs/start_dev.sh
+./execs/start_dev.sh
+```
+*(Também disponível em `./scripts/start_dev.sh`.)*
+
+- **Frontend (UI)**: `http://127.0.0.1:5173`
+- **Backend (API)**: `http://127.0.0.1:8000`
+- **Swagger Docs**: `http://127.0.0.1:8000/docs`
+- Para encerrar os serviços, pressione `CTRL+C` (ou pressione qualquer tecla na janela controladora do `start_dev.bat`).
+- Para rodar toda a suíte de testes automatizados no Windows com um clique, execute `.\execs\run_tests.bat`.
+
+---
+
+### Execução Manual — Backend
 ```bash
 # Crie um ambiente virtual (ex.: venv)
 python -m venv backend/venv

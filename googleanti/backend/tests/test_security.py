@@ -840,3 +840,44 @@ def test_download_prevents_file_replacement_between_validation_and_streaming(iso
 
     res_race_legacy = client.get(f"/api/v1/files/download?path={proj_id}/model.glb")
     assert res_race_legacy.status_code == 403
+
+
+def test_stream_from_verified_fd_closes_descriptor_only_once(isolated_storage_and_db, monkeypatch):
+    """
+    SEC-001 (Achado A): Verifica que `_stream_from_verified_fd` fecha o descritor `fd`
+    uma única vez (via `os.fdopen(..., closefd=True)`) sem invocar `os.close(fd)` redundantemente
+    no bloco `finally`, evitando o risco de fechar outro descritor caso o sistema operacional
+    reutilize o mesmo inteiro `fd` concorrentemente.
+    Também comprova que caso `os.fdopen` falhe antes de assumir a posse do descritor,
+    o bloco `finally` executa `os.close(fd)` exatamente uma vez para evitar vazamento.
+    """
+    sample_file = settings.STORAGE_DIR / "fd_ownership_test.bin"
+    sample_file.write_bytes(b"VERIFIED_STREAM_PAYLOAD")
+
+    fd = os.open(str(sample_file), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    close_calls = []
+    orig_close = os.close
+
+    def tracked_close(target_fd):
+        close_calls.append(target_fd)
+        return orig_close(target_fd)
+
+    monkeypatch.setattr(os, "close", tracked_close)
+
+    chunks = list(routes_mod._stream_from_verified_fd(fd))
+    assert b"".join(chunks) == b"VERIFIED_STREAM_PAYLOAD"
+    # `os.fdopen(..., closefd=True)` fecha o descritor internamente em C ao sair do bloco `with`,
+    # portanto `os.close(fd)` em Python NÃO pode ter sido chamado redundantemente no `finally`!
+    assert close_calls == []
+
+    # Caso de falha antes de `os.fdopen` assumir posse: `os.close(fd)` DEVE ser chamado exatamente 1 vez
+    fd2 = os.open(str(sample_file), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    def failing_fdopen(*args, **kwargs):
+        raise OSError("Simulated fdopen failure before ownership transfer")
+
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
+    with pytest.raises(OSError, match="Simulated fdopen failure"):
+        list(routes_mod._stream_from_verified_fd(fd2))
+
+    assert close_calls == [fd2]
+
