@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { ModelViewer } from './viewer/ModelViewer';
 import type { ThreeViewer, MeshTelemetryInfo } from './viewer/ThreeViewer';
-import { GenerationPanel } from './features/generation/GenerationPanel';
+import { GenerationPanel, type ImageTo3dFormOptions } from './features/generation/GenerationPanel';
 import {
   apiService,
   type Project,
@@ -159,7 +159,7 @@ export function App() {
     if (!currentProject) return;
     setErrorMessage(null);
     setIsLoading(true);
-    setStatusMessage(`Disparando geração de ${shapeType}...`);
+    setStatusMessage(`Disparando geração procedural (${shapeType})...`);
 
     try {
       const job = await apiService.startProceduralJob(currentProject.id, {
@@ -173,6 +173,54 @@ export function App() {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorMessage(msg);
       setStatusMessage(`Falha na validação/solicitação: ${msg}`);
+    }
+  };
+
+  const handleGenerateTextTo3D = async (promptText: string) => {
+    if (!currentProject) return;
+    setErrorMessage(null);
+    setIsLoading(true);
+    setStatusMessage('Interpretando prompt semântico e gerando composição 3D...');
+
+    try {
+      const job = await apiService.startTextTo3dJob(currentProject.id, promptText);
+      setActiveJob(job);
+      pollJob(job.id, currentProject.id);
+    } catch (err: unknown) {
+      setIsLoading(false);
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorMessage(msg);
+      setStatusMessage(`Falha no Text-to-3D: ${msg}`);
+    }
+  };
+
+  const handleGenerateImageTo3D = async (file: File, options: ImageTo3dFormOptions) => {
+    if (!currentProject) return;
+    setErrorMessage(null);
+    setIsLoading(true);
+    setStatusMessage(`Enviando e validando imagem "${file.name}"...`);
+
+    try {
+      const uploaded = await apiService.uploadReferenceImage(currentProject.id, file);
+      setStatusMessage(
+        `Imagem validada (${uploaded.width}×${uploaded.height} ${uploaded.format.toUpperCase()}). Iniciando reconstrução ${options.mode}...`
+      );
+
+      const job = await apiService.startImageTo3dJob(currentProject.id, {
+        reference_image_filename: uploaded.filename,
+        mode: options.mode,
+        thickness: options.thickness,
+        resolution_scale: options.resolution_scale,
+        relief_depth: options.relief_depth,
+        base_thickness: options.base_thickness,
+      });
+      setActiveJob(job);
+      pollJob(job.id, currentProject.id);
+    } catch (err: unknown) {
+      setIsLoading(false);
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorMessage(msg);
+      setStatusMessage(`Falha no Image-to-3D: ${msg}`);
     }
   };
 
@@ -226,6 +274,25 @@ export function App() {
       ? (activeJob.metadata.inspection as Record<string, unknown>)
       : null;
 
+  const parsedIntent =
+    typeof activeJob?.metadata?.parsed_intent === 'string' ? activeJob.metadata.parsed_intent : null;
+  const detectedComponentsCount =
+    typeof activeJob?.metadata?.detected_components_count === 'number'
+      ? activeJob.metadata.detected_components_count
+      : null;
+  const extractedDimensions =
+    activeJob?.metadata?.extracted_dimensions && typeof activeJob.metadata.extracted_dimensions === 'object'
+      ? (activeJob.metadata.extracted_dimensions as Record<string, number>)
+      : null;
+  const detectedColor =
+    typeof activeJob?.metadata?.detected_color === 'string' ? activeJob.metadata.detected_color : null;
+  const imageTo3dMode =
+    typeof activeJob?.metadata?.image_to_3d_mode === 'string' ? activeJob.metadata.image_to_3d_mode : null;
+  const referenceImageFilename =
+    typeof activeJob?.metadata?.reference_image_filename === 'string'
+      ? activeJob.metadata.reference_image_filename
+      : null;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#09090b', color: '#f4f4f5', fontFamily: 'sans-serif' }}>
       {/* Topbar */}
@@ -234,7 +301,7 @@ export function App() {
           <Box color="#3b82f6" size={26} />
           <div>
             <h1 style={{ fontSize: '18px', fontWeight: 'bold', margin: 0 }}>AI 3D STUDIO</h1>
-            <span style={{ fontSize: '11px', color: '#71717a' }}>v2.1 Universal • 100% Local (127.0.0.1) • Convenção Nativa Y-up</span>
+            <span style={{ fontSize: '11px', color: '#71717a' }}>v2.2 Multimodal • 100% Local (127.0.0.1) • Convenção Nativa Y-up</span>
           </div>
         </div>
 
@@ -266,9 +333,11 @@ export function App() {
       {/* Main Content Layout */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         {/* Left Sidebar: Controls, Status, Telemetry & Multiformat Export */}
-        <aside style={{ width: '390px', background: '#121215', borderRight: '1px solid #27272a', padding: '16px', overflowY: 'auto' }}>
+        <aside style={{ width: '405px', background: '#121215', borderRight: '1px solid #27272a', padding: '16px', overflowY: 'auto' }}>
           <GenerationPanel
             onGenerate={handleGenerate}
+            onGenerateTextTo3D={handleGenerateTextTo3D}
+            onGenerateImageTo3D={handleGenerateImageTo3D}
             onCancel={handleCancelActiveJob}
             isLoading={isLoading}
             activeJobStatus={activeJob?.status || null}
@@ -302,7 +371,9 @@ export function App() {
           {activeJob && (
             <div style={{ marginTop: '12px', background: '#18181b', padding: '12px 14px', borderRadius: '8px', border: '1px solid #27272a', fontSize: '12px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                <span style={{ color: '#a1a1aa' }}>Tarefa: <code>{activeJob.id}</code></span>
+                <span style={{ color: '#a1a1aa' }}>
+                  Tarefa (<code>{activeJob.operation_type}</code>): <code>{activeJob.id}</code>
+                </span>
                 <span
                   style={{
                     padding: '2px 8px',
@@ -346,7 +417,7 @@ export function App() {
             </div>
           )}
 
-          {/* Telemetria Real da Malha */}
+          {/* Telemetria Real da Malha + Telemetria Semântica / Multimodal (Bloco 8) */}
           {telemetry && (
             <div style={{ marginTop: '14px', background: '#18181b', padding: '14px', borderRadius: '8px', border: '1px solid #27272a' }}>
               <h4 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 10px 0', display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -371,6 +442,76 @@ export function App() {
                 {activeInspection && typeof activeInspection.is_watertight === 'boolean' && (
                   <div>
                     <strong>Malha Estanque (Watertight):</strong> {activeInspection.is_watertight ? 'Sim' : 'Não'}
+                  </div>
+                )}
+
+                {/* Metadados Semânticos Text-to-3D */}
+                {parsedIntent && (
+                  <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #27272a' }}>
+                    <div>
+                      <strong>Intenção Semântica (Text-to-3D):</strong>{' '}
+                      <span style={{ color: '#60a5fa', fontWeight: 600 }}>{parsedIntent}</span>
+                    </div>
+                    {detectedComponentsCount !== null && (
+                      <div>
+                        <strong>Componentes na IR:</strong> {detectedComponentsCount}
+                      </div>
+                    )}
+                    {detectedColor && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <strong>Cor / Material:</strong>
+                        <span
+                          style={{
+                            display: 'inline-block',
+                            width: '10px',
+                            height: '10px',
+                            borderRadius: '2px',
+                            background: detectedColor,
+                            border: '1px solid #52525b',
+                          }}
+                        />
+                        <code>{detectedColor}</code>
+                      </div>
+                    )}
+                    {extractedDimensions && Object.keys(extractedDimensions).length > 0 && (
+                      <div>
+                        <strong>Dimensões Extraídas:</strong>{' '}
+                        {Object.entries(extractedDimensions)
+                          .map(([k, v]) => `${k}: ${v}`)
+                          .join(' • ')}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Metadados Image-to-3D */}
+                {imageTo3dMode && (
+                  <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #27272a' }}>
+                    <div>
+                      <strong>Modo Image-to-3D:</strong>{' '}
+                      <span style={{ color: '#60a5fa', fontWeight: 600 }}>
+                        {imageTo3dMode === 'heightmap' ? 'Mapa de Relevo (Heightmap)' : 'Extrusão de Silhueta 2D'}
+                      </span>
+                    </div>
+                    {referenceImageFilename && currentProject && (
+                      <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <img
+                          src={apiService.getReferenceImageUrl(currentProject.id, referenceImageFilename)}
+                          alt="Referência 2D"
+                          style={{
+                            width: '44px',
+                            height: '44px',
+                            objectFit: 'contain',
+                            borderRadius: '4px',
+                            background: '#09090b',
+                            border: '1px solid #3f3f46',
+                          }}
+                        />
+                        <div style={{ fontSize: '11px', color: '#a1a1aa', wordBreak: 'break-all' }}>
+                          Ref.: <code>{referenceImageFilename}</code>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -559,6 +700,7 @@ export function App() {
             <ModelViewer
               modelUrl={modelUrl}
               coordinateSystem={coordinateSystem}
+              jobMetadata={activeJob?.metadata || null}
               viewerRef={viewerRef}
               onMeshLoaded={(info) => setTelemetry(info)}
             />
@@ -576,4 +718,3 @@ export function App() {
 }
 
 export default App;
-

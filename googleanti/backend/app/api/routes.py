@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Iterator
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,11 @@ from backend.app.schemas.jobs import (
     JobStatus
 )
 from backend.app.jobs.orchestrator import JobOrchestrator
+from backend.app.procedural.image_to_3d import (
+    validate_uploaded_image_bytes,
+    MAX_UPLOAD_SIZE,
+    FORMAT_TO_MEDIA_TYPE,
+)
 from backend.app.config import settings
 
 logger = logging.getLogger("ai_3d_studio.routes")
@@ -657,7 +662,7 @@ async def create_job(data: JobCreate, db: Session = Depends(get_db)):
     )
 
     # Disparar execução em segundo plano no event loop principal (Achado B: sem bloquear o POST HTTP)
-    JobOrchestrator.dispatch_job(job.id, data.project_id, data.params)
+    JobOrchestrator.dispatch_job(job.id, data.project_id, data.params, operation_type=data.operation_type)
 
     return JobResponse(
         id=job.id,
@@ -974,6 +979,210 @@ def download_artifact(project_id: str, filename: str, db: Session = Depends(get_
         _stream_from_verified_fd(verified_fd),
         media_type=media_type,
         headers=headers
+    )
+
+
+def _collect_registered_project_images(project: ProjectModel) -> set[str]:
+    """
+    Bloco 7 (Task 7.1): Coleta os nomes de imagens de referência registradas para o projeto
+    a partir de `metadata_json` e `parameters_json`.
+    """
+    registered_images: set[str] = set()
+    for raw_json_attr in ("metadata_json", "parameters_json"):
+        raw_val = getattr(project, raw_json_attr, None)
+        if not isinstance(raw_val, str) or not raw_val.strip():
+            continue
+        try:
+            data = json.loads(raw_val)
+            if not isinstance(data, dict):
+                continue
+            ref_list = data.get("reference_images")
+            if isinstance(ref_list, list):
+                for item in ref_list:
+                    if isinstance(item, str) and ".." not in item:
+                        registered_images.add(Path(item.replace("\\", "/")).name)
+                    elif isinstance(item, dict) and isinstance(item.get("filename"), str):
+                        fname = item["filename"]
+                        if ".." not in fname:
+                            registered_images.add(Path(fname.replace("\\", "/")).name)
+            for single_key in ("active_reference_image", "reference_image_path", "reference_image_filename"):
+                sval = data.get(single_key)
+                if isinstance(sval, str) and sval.strip() and ".." not in sval:
+                    registered_images.add(Path(sval.replace("\\", "/")).name)
+        except Exception:
+            pass
+    return registered_images
+
+
+@router.post("/projects/{project_id}/images")
+async def upload_project_reference_image(
+    project_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Bloco 7 (Task 7.1): Upload seguro e contextual de imagem de referência 2D (PNG, JPG, WEBP):
+    - Valida que o projeto existe e está ativo (`status != 'deleting'`).
+    - Impõe limite estrito de tamanho (`MAX_UPLOAD_SIZE = 10 MB`).
+    - Valida magic bytes reais, extensão e decodificação via Pillow (`validate_uploaded_image_bytes`),
+      rejeitando SVG, scripts, executáveis, PDFs, arquivos corrompidos ou extensão falsificada.
+    - Salva atomicamente em `STORAGE_DIR/{project_id}/ref_image_{uuid}.{ext}`.
+    - Registra o caminho relativo em `metadata_json` e `parameters_json` do projeto no SQLite.
+    """
+    if not SAFE_PROJECT_ID_REGEX.match(project_id) or ".." in project_id or "\x00" in project_id:
+        raise HTTPException(status_code=400, detail="Identificador de projeto inválido")
+
+    project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
+    if not project or project.status == "deleting":
+        raise HTTPException(status_code=404, detail="Projeto não encontrado ou em processo de exclusão")
+
+    raw_bytes = await file.read(MAX_UPLOAD_SIZE + 1)
+    if len(raw_bytes) == 0:
+        raise HTTPException(status_code=400, detail="O arquivo de imagem enviado está vazio.")
+    if len(raw_bytes) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"O arquivo excede o tamanho máximo permitido de {MAX_UPLOAD_SIZE // (1024 * 1024)} MB.",
+        )
+
+    try:
+        canonical_ext, detected_format, width, height = validate_uploaded_image_bytes(
+            raw_bytes, file.filename or ""
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    raw_project_dir = settings.STORAGE_DIR / project_id
+    if raw_project_dir.exists() and _contains_symlink_in_chain(raw_project_dir, settings.STORAGE_DIR):
+        raise HTTPException(status_code=403, detail="Diretório do projeto contém link simbólico não autorizado")
+
+    raw_project_dir.mkdir(parents=True, exist_ok=True)
+    project_dir = raw_project_dir.resolve()
+    storage_root = settings.STORAGE_DIR.resolve()
+    if os.path.commonpath([str(storage_root), str(project_dir)]) != str(storage_root) or project_dir == storage_root:
+        raise HTTPException(status_code=403, detail="Caminho de projeto fora do armazenamento autorizado")
+
+    safe_filename = f"ref_image_{uuid.uuid4().hex[:10]}{canonical_ext}"
+    target_path = raw_project_dir / safe_filename
+    tmp_path = raw_project_dir / f".tmp_{safe_filename}_{uuid.uuid4().hex[:6]}.tmp"
+
+    try:
+        with open(tmp_path, "wb") as f_out:
+            f_out.write(raw_bytes)
+            f_out.flush()
+            os.fsync(f_out.fileno())
+        os.replace(str(tmp_path), str(target_path))
+        _sync_directory_if_supported(raw_project_dir)
+    except Exception as e:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"Falha ao gravar imagem de referência no armazenamento: {e}")
+
+    rel_image_path = str(target_path.relative_to(settings.BASE_DIR))
+
+    # Atualizar metadata_json e parameters_json no SQLite para rastreabilidade
+    for attr_name in ("metadata_json", "parameters_json"):
+        raw_json = getattr(project, attr_name, None)
+        try:
+            parsed = json.loads(raw_json or "{}")
+            if not isinstance(parsed, dict):
+                parsed = {}
+        except Exception:
+            parsed = {}
+        ref_list = parsed.get("reference_images")
+        if not isinstance(ref_list, list):
+            ref_list = []
+        if rel_image_path not in ref_list:
+            ref_list.append(rel_image_path)
+        parsed["reference_images"] = ref_list
+        parsed["active_reference_image"] = safe_filename
+        parsed["reference_image_path"] = rel_image_path
+        setattr(project, attr_name, json.dumps(parsed))
+
+    project.updated_at = get_utc_now()
+    db.commit()
+
+    return {
+        "project_id": project_id,
+        "filename": safe_filename,
+        "relative_path": rel_image_path,
+        "format": detected_format,
+        "width": width,
+        "height": height,
+        "size_bytes": len(raw_bytes),
+        "image_url": f"/api/v1/projects/{project_id}/images/{safe_filename}",
+    }
+
+
+@router.get("/projects/{project_id}/images/{filename}")
+def get_project_reference_image(project_id: str, filename: str, db: Session = Depends(get_db)):
+    """
+    Bloco 7 (Task 7.1): Endpoint contextual seguro para leitura/exibição da imagem de referência do projeto.
+    Reutiliza todas as validações anti-symlink, confinamento via `os.path.commonpath`, registro no projeto
+    e streaming direto a partir do descritor validado (`_open_verified_regular_file`).
+    """
+    if not SAFE_PROJECT_ID_REGEX.match(project_id) or ".." in project_id or "\x00" in project_id:
+        raise HTTPException(status_code=400, detail="Identificador de projeto inválido")
+
+    if not SAFE_FILENAME_REGEX.match(filename) or ".." in filename or "\x00" in filename:
+        raise HTTPException(status_code=400, detail="Nome de arquivo de imagem inválido")
+
+    suffix = Path(filename).suffix.lower()
+    if suffix not in FORMAT_TO_MEDIA_TYPE:
+        raise HTTPException(status_code=403, detail="Formato de arquivo não permitido neste endpoint")
+
+    project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
+    if not project or project.status == "deleting":
+        raise HTTPException(status_code=404, detail="Projeto não encontrado ou em processo de exclusão")
+
+    raw_project_dir = settings.STORAGE_DIR / project_id
+    raw_target_path = raw_project_dir / filename
+
+    if _contains_symlink_in_chain(raw_target_path, settings.STORAGE_DIR):
+        raise HTTPException(status_code=403, detail="Links simbólicos não são permitidos")
+
+    if not raw_target_path.exists() or raw_target_path.is_dir():
+        raise HTTPException(status_code=404, detail="Imagem de referência não encontrada")
+
+    storage_root = settings.STORAGE_DIR.resolve()
+    quarantine_root = settings.QUARANTINE_DIR.resolve()
+    project_dir = raw_project_dir.resolve()
+    target_path = raw_target_path.resolve()
+
+    try:
+        if os.path.commonpath([str(storage_root), str(project_dir)]) != str(storage_root) or project_dir == storage_root:
+            raise HTTPException(status_code=403, detail="Acesso não autorizado")
+        if os.path.commonpath([str(quarantine_root), str(target_path)]) == str(quarantine_root):
+            raise HTTPException(status_code=403, detail="Acesso a arquivos de quarentena é proibido")
+        if os.path.commonpath([str(project_dir), str(target_path)]) != str(project_dir) or target_path == project_dir:
+            raise HTTPException(status_code=403, detail="Acesso não autorizado a caminho fora do projeto")
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Acesso não autorizado")
+
+    if target_path.parent != project_dir or target_path.name != filename:
+        raise HTTPException(status_code=403, detail="Acesso não autorizado a subdiretórios ou links")
+
+    registered_images = _collect_registered_project_images(project)
+    if filename not in registered_images:
+        raise HTTPException(status_code=403, detail="Imagem solicitada não está registrada neste projeto")
+
+    opened = _open_verified_regular_file(raw_target_path, target_path)
+    if opened is None:
+        raise HTTPException(status_code=403, detail="Falha na verificação de integridade do arquivo de imagem")
+
+    verified_fd, verified_size = opened
+    media_type = FORMAT_TO_MEDIA_TYPE[suffix]
+    headers = {
+        "Content-Disposition": f'inline; filename="{target_path.name}"',
+        "Content-Length": str(verified_size),
+    }
+    return StreamingResponse(
+        _stream_from_verified_fd(verified_fd),
+        media_type=media_type,
+        headers=headers,
     )
 
 # Rota mantida estritamente com autorização contextual idêntica para compatibilidade com o frontend atual

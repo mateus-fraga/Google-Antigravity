@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 from backend.app.schemas.jobs import JobStatus
 from backend.app.storage.database import SessionLocal, JobModel, ProjectModel
 from backend.app.procedural.engine import ProceduralGenerator
+from backend.app.procedural.text_to_3d import TextTo3DGenerator
+from backend.app.procedural.image_to_3d import ImageTo3DGenerator
 from backend.app.exporters.mesh_exporter import ModelExporter
 from backend.app.config import settings
 
@@ -304,18 +306,21 @@ class JobOrchestrator:
         job_id: str,
         project_id: str,
         params: Dict[str, Any],
-        cancel_event: threading.Event
+        cancel_event: threading.Event,
+        operation_type: str = "procedural_generation"
     ) -> Dict[str, Any]:
         """
-        Worker síncrono executado fora do event loop principal via `asyncio.to_thread` (Task 2.1 / 2.2).
+        Worker síncrono executado fora do event loop principal via `asyncio.to_thread` (Task 2.1 / 2.2 / 6.4).
+        Suporta `procedural_generation` e `text_to_3d`.
         Possui pontos de controle cooperativos (`check_cancel`) antes e depois de cada etapa CPU-bound:
-        - Checkpoint 1: Antes da geração geométrica 2D/3D (`ProceduralGenerator.generate_by_params`).
+        - Checkpoint 1: Antes da geração geométrica 2D/3D (`ProceduralGenerator` / `TextTo3DGenerator`).
         - Checkpoint 2: Após a geração do mesh e antes da inspeção geométrica.
         - Checkpoint 3: Antes e durante a exportação/validação atômica (`ModelExporter.export_and_validate`).
         - Checkpoint 4: Após a exportação, antes de autorizar a publicação no projeto/job.
         Se cancelado em qualquer ponto, limpa imediatamente quaisquer arquivos temporários ou parciais.
         """
         model_path: Optional[Path] = None
+        semantic_metadata: Optional[Dict[str, Any]] = None
 
         def check_cancel():
             if cancel_event.is_set() or cls.is_cancel_requested(job_id):
@@ -325,8 +330,55 @@ class JobOrchestrator:
         try:
             # Checkpoint 1: Pré-geração geométrica
             check_cancel()
-            shape_type = str(params.get("shape_type", "box"))
-            mesh = ProceduralGenerator.generate_by_params(shape_type, params)
+            if operation_type == "image_to_3d" or ("reference_image_filename" in params and "shape_type" not in params):
+                ref_filename = str(params.get("reference_image_filename") or params.get("image_filename") or "").strip()
+                if not ref_filename or ".." in ref_filename or "/" in ref_filename or "\\" in ref_filename:
+                    raise ValueError("Nome de imagem de referência inválido.")
+                project_dir_check = settings.STORAGE_DIR / project_id
+                image_path = project_dir_check / ref_filename
+                if not image_path.exists() or not image_path.is_file() or image_path.is_symlink():
+                    raise ValueError(f"Imagem de referência '{ref_filename}' não encontrada no projeto {project_id}.")
+                mode = str(params.get("mode", "silhouette")).strip().lower()
+                if mode == "heightmap":
+                    base_t = float(params.get("base_thickness", 0.05))
+                    relief_d = float(params.get("relief_depth", 0.15))
+                    mesh = ImageTo3DGenerator.generate_from_heightmap(
+                        image_path=image_path,
+                        base_thickness=base_t,
+                        relief_depth=relief_d,
+                        cancel_check=check_cancel,
+                    )
+                    semantic_metadata = {
+                        "image_to_3d_mode": "heightmap",
+                        "reference_image_filename": ref_filename,
+                        "base_thickness": base_t,
+                        "relief_depth": relief_d,
+                    }
+                else:
+                    thick = float(params.get("thickness", 0.1))
+                    rscale = float(params.get("resolution_scale", 1.0))
+                    mesh = ImageTo3DGenerator.generate_from_silhouette(
+                        image_path=image_path,
+                        thickness=thick,
+                        resolution_scale=rscale,
+                        cancel_check=check_cancel,
+                    )
+                    semantic_metadata = {
+                        "image_to_3d_mode": "silhouette",
+                        "reference_image_filename": ref_filename,
+                        "thickness": thick,
+                        "resolution_scale": rscale,
+                    }
+                shape_type = f"img3d_{mode}"
+            elif operation_type == "text_to_3d" or ("prompt" in params and "shape_type" not in params):
+                prompt_text = str(params.get("prompt", ""))
+                ir, semantic_metadata = TextTo3DGenerator.parse_prompt_to_ir(prompt_text)
+                check_cancel()
+                mesh = ProceduralGenerator.generate_from_ir(ir, align_to_ground=True)
+                shape_type = f"text3d_{semantic_metadata.get('parsed_intent', 'object')}"
+            else:
+                shape_type = str(params.get("shape_type", "box"))
+                mesh = ProceduralGenerator.generate_by_params(shape_type, params)
 
             # Checkpoint 2: Pós-geração do mesh / pré-inspeção
             check_cancel()
@@ -361,6 +413,7 @@ class JobOrchestrator:
                 "result_files": [rel_glb],
                 "inspect_info": inspect_info,
                 "export_meta": export_meta,
+                "semantic_metadata": semantic_metadata,
             }
         except JobCancelledException:
             cls._cleanup_partial_files(project_id, locals().get("candidate_files") or ([model_path] if model_path else None), job_id=job_id)
@@ -370,13 +423,31 @@ class JobOrchestrator:
             raise
 
     @classmethod
-    async def run_procedural_job_async(cls, job_id: str, project_id: str, params: Dict[str, Any]):
+    async def run_procedural_job_async(
+        cls,
+        job_id: str,
+        project_id: str,
+        params: Dict[str, Any],
+        operation_type: Optional[str] = None
+    ):
         """
         Orquestra o ciclo de vida assíncrono do job respeitando o semáforo de concorrência
         (`MAX_CONCURRENT_JOBS = 2`) e isolando o processamento pesado em worker thread (`asyncio.to_thread`).
         """
         with cls._state_lock:
             cancel_event = cls._cancellation_events.setdefault(job_id, threading.Event())
+
+        if not operation_type:
+            db_op = SessionLocal()
+            try:
+                j_row = db_op.query(JobModel).filter(JobModel.id == job_id).first()
+                if j_row and j_row.operation_type:
+                    operation_type = j_row.operation_type
+            except Exception:
+                pass
+            finally:
+                db_op.close()
+        effective_op = operation_type or "procedural_generation"
 
         semaphore = cls._get_semaphore()
         model_path: Optional[Path] = None
@@ -427,7 +498,8 @@ class JobOrchestrator:
                     job_id,
                     project_id,
                     params,
-                    cancel_event
+                    cancel_event,
+                    effective_op
                 )
                 model_path = worker_result["model_path"]
                 candidate_files = worker_result.get("candidate_files", [model_path])
@@ -435,6 +507,7 @@ class JobOrchestrator:
                 result_files_list = worker_result.get("result_files", [rel_path])
                 inspect_info = worker_result["inspect_info"]
                 export_meta = worker_result["export_meta"]
+                semantic_meta = worker_result.get("semantic_metadata")
 
                 # Verificação final antes de publicar o resultado no Projeto e marcar como Concluída
                 if cancel_event.is_set() or cls.is_cancel_requested(job_id):
@@ -468,26 +541,40 @@ class JobOrchestrator:
                             return
 
                         proj.active_model_path = rel_path
-                        enriched_params = dict(params)
+                        try:
+                            existing_proj_params = json.loads(proj.parameters_json or "{}")
+                            if not isinstance(existing_proj_params, dict):
+                                existing_proj_params = {}
+                        except Exception:
+                            existing_proj_params = {}
+                        enriched_params = dict(existing_proj_params)
+                        enriched_params.update(params)
                         enriched_params["coordinate_system"] = inspect_info.get("coordinate_system", "Y-up")
                         enriched_params["geometry_schema_version"] = inspect_info.get("geometry_schema_version", 2)
+                        if semantic_meta:
+                            enriched_params.update(semantic_meta)
                         proj.parameters_json = json.dumps(enriched_params)
                         proj.updated_at = get_now()
                         db.commit()
                     finally:
                         db.close()
 
+                final_meta: Dict[str, Any] = {
+                    "coordinate_system": inspect_info.get("coordinate_system", "Y-up"),
+                    "geometry_schema_version": inspect_info.get("geometry_schema_version", 2),
+                    "inspection": inspect_info,
+                    "export": export_meta,
+                }
+                if semantic_meta:
+                    final_meta.update(semantic_meta)
+                    final_meta["text_to_3d"] = semantic_meta
+
                 completed_ok = cls.update_job_status(
                     job_id,
                     JobStatus.COMPLETED,
                     progress=1.0,
                     result_files=result_files_list,
-                    metadata={
-                        "coordinate_system": inspect_info.get("coordinate_system", "Y-up"),
-                        "geometry_schema_version": inspect_info.get("geometry_schema_version", 2),
-                        "inspection": inspect_info,
-                        "export": export_meta,
-                    }
+                    metadata=final_meta
                 )
                 if not completed_ok:
                     # Caso tenha sido cancelado concorrentemente, não deixar arquivo órfão não registrado
@@ -545,7 +632,13 @@ class JobOrchestrator:
             return new_loop
 
     @classmethod
-    def dispatch_job(cls, job_id: str, project_id: str, params: Dict[str, Any]):
+    def dispatch_job(
+        cls,
+        job_id: str,
+        project_id: str,
+        params: Dict[str, Any],
+        operation_type: Optional[str] = None
+    ):
         """
         Agenda a execução assíncrona do job no event loop principal registrado (`_main_loop`),
         no event loop ativo da coroutine ou no loop de background persistente, garantindo:
@@ -568,7 +661,7 @@ class JobOrchestrator:
             running_loop = None
 
         if running_loop is target_loop:
-            task = target_loop.create_task(cls.run_procedural_job_async(job_id, project_id, params))
+            task = target_loop.create_task(cls.run_procedural_job_async(job_id, project_id, params, operation_type))
             with cls._state_lock:
                 cls._running_tasks[job_id] = task
             return task
@@ -577,7 +670,7 @@ class JobOrchestrator:
             task_holder: Dict[str, asyncio.Task] = {}
 
             def _schedule_on_target():
-                t = target_loop.create_task(cls.run_procedural_job_async(job_id, project_id, params))
+                t = target_loop.create_task(cls.run_procedural_job_async(job_id, project_id, params, operation_type))
                 with cls._state_lock:
                     cls._running_tasks[job_id] = t
                 task_holder["task"] = t

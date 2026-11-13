@@ -225,6 +225,18 @@ class Transformation(BaseModel):
     rotation: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])  # Euler angles in degrees
     scale: List[float] = Field(default_factory=lambda: [1.0, 1.0, 1.0])
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_translation_alias(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "translation" in data and "position" not in data:
+            data = dict(data)
+            data["position"] = data["translation"]
+        return data
+
+    @property
+    def translation(self) -> List[float]:
+        return self.position
+
     @field_validator("position", "rotation")
     @classmethod
     def validate_vec3_finite(cls, v: List[Any], info) -> List[float]:
@@ -241,9 +253,27 @@ class Transformation(BaseModel):
 
 class MaterialDef(BaseModel):
     color: str = "#888888"
+    base_color: Optional[str] = None
     roughness: float = Field(0.5, ge=0.0, le=1.0, allow_inf_nan=False)
     metalness: float = Field(0.1, ge=0.0, le=1.0, allow_inf_nan=False)
     name: Optional[str] = "DefaultMaterial"
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_color_and_base_color_before(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            if data.get("base_color") and not data.get("color"):
+                data["color"] = data["base_color"]
+            elif data.get("color") and not data.get("base_color"):
+                data["base_color"] = data["color"]
+        return data
+
+    @model_validator(mode="after")
+    def sync_color_and_base_color_after(self) -> "MaterialDef":
+        if not self.base_color:
+            self.base_color = self.color
+        return self
 
     @field_validator("roughness", "metalness", mode="before")
     @classmethod
@@ -284,6 +314,7 @@ class IntermediateObjectRepresentation(BaseModel):
     schema_version: str = "2.1.0"
     coordinate_system: str = "Y-up"
     geometry_schema_version: int = 2
+    align_to_ground: bool = True
     id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
     category: ObjectCategory = ObjectCategory.MECHANICAL

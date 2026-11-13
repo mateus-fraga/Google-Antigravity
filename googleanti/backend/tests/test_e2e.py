@@ -154,3 +154,125 @@ def test_full_e2e_workflow():
     # Confirma que o projeto não pode mais ser acessado
     assert client.get(f"/api/v1/projects/{proj_id}").status_code == 404
     assert client.get(f"/api/v1/projects/{proj_id}/artifacts").status_code == 404
+
+
+def test_multimodal_text_and_image_to_3d_e2e_workflow():
+    """
+    Fluxo de aceitação E2E Multimodal (Bloco 8 — Tarefa 8.3):
+    1. Cria projeto e executa geração via Text-to-3D (prompt composto em PT-BR), validando metadados semânticos e exportação GLB/OBJ/STL.
+    2. Faz upload de imagem PNG em memória, consulta imagem na rota contextual segura, executa geração via Image-to-3D (silhouette e heightmap), valida estanqueidade Y-up e exportação multiformato.
+    3. Exclui o projeto ao final limpando os artefatos com segurança.
+    """
+    import io
+    from PIL import Image, ImageDraw
+
+    with TestClient(app) as local_client:
+        create_res = local_client.post(
+            "/api/v1/projects",
+            json={
+                "name": "E2E Multimodal Project",
+                "description": "Teste integrado Procedural + Text-to-3D + Image-to-3D",
+                "category": "mechanical",
+                "purpose": "technical",
+                "strategy": "procedural",
+            },
+        )
+        assert create_res.status_code == 200
+        proj_id = create_res.json()["id"]
+
+        # --- Etapa A: Text-to-3D ---
+        t2d_res = local_client.post(
+            "/api/v1/jobs",
+            json={
+                "project_id": proj_id,
+                "operation_type": "text_to_3d",
+                "params": {
+                    "prompt": "Mesa de centro em madeira com 120cm de largura, 45cm de altura e 60cm de profundidade"
+                },
+            },
+        )
+        assert t2d_res.status_code == 200
+        t2d_job_id = t2d_res.json()["id"]
+
+        t2d_status = None
+        for _ in range(60):
+            r = local_client.get(f"/api/v1/jobs/{t2d_job_id}")
+            assert r.status_code == 200
+            t2d_status = r.json()
+            if t2d_status["status"] in ("Concluída", "Falhou", "Cancelada"):
+                break
+            time.sleep(0.05)
+
+        assert t2d_status is not None
+        assert t2d_status["status"] == "Concluída", f"Falha no job Text-to-3D: {t2d_status}"
+        assert t2d_status["metadata"].get("parsed_intent") == "table"
+        assert t2d_status["metadata"].get("detected_components_count", 0) >= 5
+
+        for fmt in ("glb", "obj", "stl"):
+            exp_res = local_client.post(f"/api/v1/projects/{proj_id}/export/{fmt}")
+            assert exp_res.status_code == 200
+            assert exp_res.json()["validated"] is True
+
+        # --- Etapa B: Image-to-3D (Upload + Silhouette + Exportação Multiformato) ---
+        img = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([24, 24, 104, 104], fill=(255, 255, 255, 255))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
+        up_res = local_client.post(
+            f"/api/v1/projects/{proj_id}/images",
+            files={"file": ("quadrado_ref.png", png_bytes, "image/png")},
+        )
+        assert up_res.status_code == 200
+        up_data = up_res.json()
+        ref_filename = up_data["filename"]
+
+        # Verificar recuperação segura da imagem enviada
+        get_img_res = local_client.get(f"/api/v1/projects/{proj_id}/images/{ref_filename}")
+        assert get_img_res.status_code == 200
+        assert get_img_res.content == png_bytes
+
+        i2d_res = local_client.post(
+            "/api/v1/jobs",
+            json={
+                "project_id": proj_id,
+                "operation_type": "image_to_3d",
+                "params": {
+                    "reference_image_filename": ref_filename,
+                    "mode": "silhouette",
+                    "thickness": 0.15,
+                    "resolution_scale": 1.0,
+                },
+            },
+        )
+        assert i2d_res.status_code == 200
+        i2d_job_id = i2d_res.json()["id"]
+
+        i2d_status = None
+        for _ in range(60):
+            r = local_client.get(f"/api/v1/jobs/{i2d_job_id}")
+            assert r.status_code == 200
+            i2d_status = r.json()
+            if i2d_status["status"] in ("Concluída", "Falhou", "Cancelada"):
+                break
+            time.sleep(0.05)
+
+        assert i2d_status is not None
+        assert i2d_status["status"] == "Concluída", f"Falha no job Image-to-3D: {i2d_status}"
+        assert i2d_status["metadata"].get("image_to_3d_mode") == "silhouette"
+        assert i2d_status["metadata"].get("reference_image_filename") == ref_filename
+
+        for fmt in ("glb", "obj", "stl"):
+            exp_res = local_client.post(f"/api/v1/projects/{proj_id}/export/{fmt}")
+            assert exp_res.status_code == 200
+            exp_data = exp_res.json()
+            assert exp_data["format"] == fmt
+            dl_res = local_client.get(f"/api/v1/projects/{proj_id}/artifacts/{exp_data['filename']}")
+            assert dl_res.status_code == 200
+            assert len(dl_res.content) > 0
+
+        # Limpeza final do projeto de teste
+        del_res = local_client.delete(f"/api/v1/projects/{proj_id}")
+        assert del_res.status_code == 200

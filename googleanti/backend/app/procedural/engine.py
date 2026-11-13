@@ -1,11 +1,13 @@
 import math
 import numpy as np
 import trimesh
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from backend.app.schemas.geometry import (
     _ensure_finite_number,
     _ensure_strict_int,
     validate_procedural_parameters_dict,
+    Component,
+    IntermediateObjectRepresentation,
     MIN_DIMENSION,
     MAX_DIMENSION,
     MIN_SECTIONS,
@@ -13,6 +15,90 @@ from backend.app.schemas.geometry import (
     MIN_GEAR_TEETH,
     MAX_GEAR_TEETH,
 )
+
+_NAMED_COLORS_HEX: Dict[str, str] = {
+    "vermelho": "#ef4444",
+    "red": "#ef4444",
+    "azul": "#3b82f6",
+    "blue": "#3b82f6",
+    "verde": "#22c55e",
+    "green": "#22c55e",
+    "amarelo": "#eab308",
+    "yellow": "#eab308",
+    "dourado": "#d4af37",
+    "ouro": "#d4af37",
+    "gold": "#d4af37",
+    "prata": "#c0c0c0",
+    "prateado": "#c0c0c0",
+    "silver": "#c0c0c0",
+    "metalico": "#94a3b8",
+    "metálico": "#94a3b8",
+    "metallic": "#94a3b8",
+    "aco": "#94a3b8",
+    "aço": "#94a3b8",
+    "steel": "#94a3b8",
+    "cinza": "#888888",
+    "gray": "#888888",
+    "grey": "#888888",
+    "preto": "#1f2937",
+    "black": "#1f2937",
+    "branco": "#f8fafc",
+    "white": "#f8fafc",
+    "laranja": "#f97316",
+    "orange": "#f97316",
+    "roxo": "#a855f7",
+    "purple": "#a855f7",
+    "marrom": "#8b5a2b",
+    "madeira": "#8b5a2b",
+    "brown": "#8b5a2b",
+    "wood": "#8b5a2b",
+    "bronze": "#cd7f32",
+    "cobre": "#b87333",
+    "copper": "#b87333",
+    "ciano": "#06b6d4",
+    "cyan": "#06b6d4",
+}
+
+_COMPONENT_SHAPE_ALIASES: Dict[str, str] = {
+    "box": "box",
+    "cube": "box",
+    "cubo": "box",
+    "bloco": "box",
+    "wall": "wall",
+    "parede": "wall",
+    "table_top": "box",
+    "table_leg": "box",
+    "base": "box",
+    "capitel": "box",
+    "capital": "box",
+    "slab": "box",
+    "cylinder": "cylinder",
+    "cilindro": "cylinder",
+    "column": "cylinder",
+    "coluna": "cylinder",
+    "shaft": "cylinder",
+    "eixo": "cylinder",
+    "rod": "cylinder",
+    "tube": "cylinder",
+    "disk": "cylinder",
+    "disco": "cylinder",
+    "sphere": "sphere",
+    "esfera": "sphere",
+    "ball": "sphere",
+    "bola": "sphere",
+    "cone": "cone",
+    "roof": "cone",
+    "teto": "cone",
+    "topo_conico": "cone",
+    "torus": "torus",
+    "ring": "torus",
+    "anel": "torus",
+    "argola": "torus",
+    "gear": "gear",
+    "engrenagem": "gear",
+    "table": "table",
+    "mesa": "table",
+}
 
 # Matriz de rotação de -90 graus em torno do eixo X:
 # Converte primitivas nativas do Trimesh geradas com eixo de extrusão Z (base XY)
@@ -370,6 +456,147 @@ class ProceduralGenerator:
             )
         else:
             raise ValueError(f"Forma procedural não suportada: '{shape_type}'")
+
+    @classmethod
+    def _parse_color_to_rgba(cls, color_str: Optional[str]) -> np.ndarray:
+        """
+        Converte uma string hexadecimal (#RRGGBB ou #RGB) ou nome de cor em um vetor RGBA uint8 [R, G, B, 255].
+        """
+        if not color_str or not isinstance(color_str, str):
+            return np.array([136, 136, 136, 255], dtype=np.uint8)
+        raw = color_str.strip().lower()
+        if raw in _NAMED_COLORS_HEX:
+            raw = _NAMED_COLORS_HEX[raw]
+        if raw.startswith("#"):
+            raw = raw[1:]
+        if len(raw) == 3:
+            raw = "".join(c * 2 for c in raw)
+        if len(raw) >= 6:
+            try:
+                r = int(raw[0:2], 16)
+                g = int(raw[2:4], 16)
+                b = int(raw[4:6], 16)
+                a = int(raw[6:8], 16) if len(raw) == 8 else 255
+                return np.array([r, g, b, a], dtype=np.uint8)
+            except ValueError:
+                pass
+        return np.array([136, 136, 136, 255], dtype=np.uint8)
+
+    @classmethod
+    def _build_single_component_meshes(cls, comp: Component) -> List[trimesh.Trimesh]:
+        """
+        Constrói recursivamente a malha de um `Component` e de seus `children`, aplicando:
+        1. Escala (`scale = [sx, sy, sz]`)
+        2. Rotação Euler em graus (`rotation = [rx, ry, rz]`) convertida para matriz 4x4
+        3. Translação em metros (`position` / `translation = [tx, ty, tz]`)
+        4. Atribuição de cor por vértice/face (`MaterialDef.base_color` / `color`)
+        """
+        raw_type = comp.type.strip().lower()
+        mapped_shape = _COMPONENT_SHAPE_ALIASES.get(raw_type, raw_type)
+        comp_mesh = cls.generate_by_params(mapped_shape, comp.parameters)
+
+        # 1. Aplicar escala se diferente de [1, 1, 1]
+        sx, sy, sz = comp.transformation.scale
+        if abs(sx - 1.0) > 1e-9 or abs(sy - 1.0) > 1e-9 or abs(sz - 1.0) > 1e-9:
+            scale_mat = np.diag([float(sx), float(sy), float(sz), 1.0])
+            comp_mesh.apply_transform(scale_mat)
+
+        # 2. Aplicar rotação Euler (em graus -> radianos) convertida para matriz 4x4
+        rx_deg, ry_deg, rz_deg = comp.transformation.rotation
+        if abs(rx_deg) > 1e-9 or abs(ry_deg) > 1e-9 or abs(rz_deg) > 1e-9:
+            # Se houver rotação em torno de X ou Z (ex.: eixo horizontal), centralizar antes de rotacionar
+            # para preservar simetria em torno da posição alvo; caso seja apenas rotação em torno de Y,
+            # a origem no plano XZ já está centrada em (0, 0).
+            if abs(rx_deg) > 1e-9 or abs(rz_deg) > 1e-9:
+                bbox_center = comp_mesh.bounds.mean(axis=0)
+                comp_mesh.apply_translation(-bbox_center)
+            rot_mat = trimesh.transformations.euler_matrix(
+                math.radians(float(rx_deg)),
+                math.radians(float(ry_deg)),
+                math.radians(float(rz_deg)),
+                axes="sxyz",
+            )
+            comp_mesh.apply_transform(rot_mat)
+
+        # 3. Aplicar translação em metros
+        tx, ty, tz = comp.transformation.position
+        if abs(tx) > 1e-9 or abs(ty) > 1e-9 or abs(tz) > 1e-9:
+            comp_mesh.apply_translation([float(tx), float(ty), float(tz)])
+
+        # 4. Aplicar cor/material (visual.vertex_colors)
+        mat_color = None
+        if comp.material is not None:
+            mat_color = comp.material.base_color or comp.material.color
+        elif isinstance(comp.parameters.get("color"), str):
+            mat_color = comp.parameters["color"]
+        rgba = cls._parse_color_to_rgba(mat_color)
+        comp_mesh.visual.vertex_colors = np.tile(rgba, (len(comp_mesh.vertices), 1))
+
+        meshes: List[trimesh.Trimesh] = [comp_mesh]
+        for child in comp.children:
+            child_meshes = cls._build_single_component_meshes(child)
+            # Se o componente pai possui translação, aplicar deslocamento relativo aos filhos caso necessário
+            meshes.extend(child_meshes)
+        return meshes
+
+    @classmethod
+    def generate_from_ir(
+        cls,
+        ir: IntermediateObjectRepresentation,
+        align_to_ground: Optional[bool] = None,
+    ) -> trimesh.Trimesh:
+        r"""
+        Bloco 6 (Task 6.2): Constrói uma malha 3D unificada a partir de uma instância de
+        `IntermediateObjectRepresentation` (IOR) contendo um ou mais `Component`s:
+        - Instancia cada componente usando as primitivas Y-up (`box`, `cylinder`, `sphere`, `cone`, `torus`, `gear`, `table`);
+        - Aplica determinísticamente `scale`, `rotation` (Euler em graus -> matriz 4x4) e `position`/`translation` (metros);
+        - Aplica cores de vértice (`visual.vertex_colors`) a partir de `MaterialDef.base_color`/`color`;
+        - Concatena os componentes em uma malha unificada;
+        - Assenta a base no plano XZ ($Y_{\min} = 0.0$) quando `align_to_ground=True`;
+        - Valida vértices/normais finitas via `_finalize_and_verify_mesh` e anota `coordinate_system: "Y-up"`
+          e `geometry_schema_version: 2`.
+        """
+        if not isinstance(ir, IntermediateObjectRepresentation):
+            if isinstance(ir, dict):
+                ir = IntermediateObjectRepresentation(**ir)
+            else:
+                raise ValueError("Entrada inválida: esperado uma instância de IntermediateObjectRepresentation.")
+
+        if not ir.components:
+            raise ValueError("A representação intermediária (IOR) deve conter pelo menos um componente geométrico.")
+
+        all_meshes: List[trimesh.Trimesh] = []
+        for comp in ir.components:
+            all_meshes.extend(cls._build_single_component_meshes(comp))
+
+        if len(all_meshes) == 1:
+            combined = all_meshes[0].copy()
+        else:
+            combined = trimesh.util.concatenate(all_meshes)
+
+        should_align = ir.align_to_ground if align_to_ground is None else bool(align_to_ground)
+        if should_align and not combined.is_empty and combined.bounds is not None:
+            min_y = float(combined.bounds[0][1])
+            if abs(min_y) > 1e-9:
+                combined.apply_translation([0.0, -min_y, 0.0])
+
+        saved_vertex_colors = None
+        try:
+            if hasattr(combined, "visual") and getattr(combined.visual, "vertex_colors", None) is not None:
+                saved_vertex_colors = np.array(combined.visual.vertex_colors, copy=True)
+        except Exception:
+            saved_vertex_colors = None
+
+        finalized = cls._finalize_and_verify_mesh(combined, shape_type=ir.name or "composite")
+        if saved_vertex_colors is not None and len(saved_vertex_colors) == len(finalized.vertices):
+            finalized.visual.vertex_colors = saved_vertex_colors
+
+        finalized.metadata["coordinate_system"] = cls.COORDINATE_SYSTEM
+        finalized.metadata["geometry_schema_version"] = cls.GEOMETRY_SCHEMA_VERSION
+        finalized.metadata["ir_id"] = ir.id
+        finalized.metadata["ir_name"] = ir.name
+        finalized.metadata["component_count"] = len(all_meshes)
+        return finalized
 
     @classmethod
     def resolve_coordinate_metadata(

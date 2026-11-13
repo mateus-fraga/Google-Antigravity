@@ -24,6 +24,14 @@ class ProjectModel(Base):
     active_model_path = Column(String, nullable=True)
     parameters_json = Column(Text, default="{}")
 
+    @property
+    def metadata_json(self) -> str:
+        return self.parameters_json or "{}"
+
+    @metadata_json.setter
+    def metadata_json(self, value: str) -> None:
+        self.parameters_json = value
+
 class JobModel(Base):
     __tablename__ = "jobs"
 
@@ -49,15 +57,19 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-    # Migração leve para garantir a coluna status na tabela projects caso o banco SQLite já exista
+    # Migração leve para garantir as colunas status e metadata_json na tabela projects caso o banco SQLite já exista
     with engine.connect() as conn:
-        try:
-            from sqlalchemy import text
-            conn.execute(text("ALTER TABLE projects ADD COLUMN status VARCHAR DEFAULT 'active'"))
-            conn.commit()
-        except Exception:
-            # Coluna já existe
-            pass
+        from sqlalchemy import text
+        for col_sql in (
+            "ALTER TABLE projects ADD COLUMN status VARCHAR DEFAULT 'active'",
+            "ALTER TABLE projects ADD COLUMN metadata_json TEXT DEFAULT '{}'",
+        ):
+            try:
+                conn.execute(text(col_sql))
+                conn.commit()
+            except Exception:
+                # Coluna já existe
+                pass
 
 def get_db():
     db = SessionLocal()

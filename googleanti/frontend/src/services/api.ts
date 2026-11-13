@@ -1,6 +1,8 @@
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
 export type SupportedExportFormat = 'glb' | 'obj' | 'stl';
+export type GenerationOperationType = 'procedural_generation' | 'text_to_3d' | 'image_to_3d';
+export type ImageTo3dMode = 'silhouette' | 'heightmap';
 
 export interface Project {
   id: string;
@@ -17,15 +19,72 @@ export interface Project {
   geometry_schema_version?: number;
 }
 
+export interface JobInspectionMetadata {
+  vertex_count?: number;
+  face_count?: number;
+  bounds?: [[number, number, number], [number, number, number]];
+  dimensions?: [number, number, number];
+  is_watertight?: boolean;
+  volume?: number | null;
+  area?: number;
+  coordinate_system?: string;
+  geometry_schema_version?: number;
+}
+
+export interface JobMetadata {
+  coordinate_system?: string;
+  geometry_schema_version?: number;
+  inspection?: JobInspectionMetadata;
+  export?: Record<string, unknown>;
+  // Text-to-3D semantic metadata
+  parsed_intent?: string;
+  detected_components_count?: number;
+  extracted_dimensions?: Record<string, number>;
+  detected_color?: string | null;
+  prompt?: string;
+  ir_id?: string;
+  text_to_3d?: Record<string, unknown>;
+  // Image-to-3D metadata
+  image_to_3d_mode?: ImageTo3dMode;
+  reference_image_filename?: string;
+  thickness?: number;
+  resolution_scale?: number;
+  base_thickness?: number;
+  relief_depth?: number;
+  image_url?: string;
+  [key: string]: unknown;
+}
+
 export interface Job {
   id: string;
   project_id: string;
-  operation_type: string;
+  operation_type: GenerationOperationType | string;
   status: string;
   progress?: number | null;
   error_message?: string | null;
   result_files: string[];
-  metadata: Record<string, unknown>;
+  metadata: JobMetadata;
+}
+
+export interface ReferenceImageUploadResponse {
+  project_id: string;
+  filename: string;
+  relative_path: string;
+  format: string;
+  width: number;
+  height: number;
+  size_bytes: number;
+  image_url: string;
+}
+
+export interface ImageTo3dJobParams {
+  reference_image_filename: string;
+  mode: ImageTo3dMode;
+  thickness?: number;
+  resolution_scale?: number;
+  base_thickness?: number;
+  relief_depth?: number;
+  [key: string]: unknown;
 }
 
 export interface ProjectArtifactInfo {
@@ -103,13 +162,17 @@ export const apiService = {
     return res.json();
   },
 
-  async startProceduralJob(projectId: string, params: Record<string, unknown>): Promise<Job> {
+  async startProceduralJob(
+    projectId: string,
+    params: Record<string, unknown>,
+    operationType: GenerationOperationType = 'procedural_generation'
+  ): Promise<Job> {
     const res = await fetch(`${API_BASE}/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         project_id: projectId,
-        operation_type: 'procedural_generation',
+        operation_type: operationType,
         params,
       }),
     });
@@ -117,6 +180,39 @@ export const apiService = {
       throw new Error(await parseApiError(res, 'Parâmetros inválidos ou falha ao iniciar tarefa de geração'));
     }
     return res.json();
+  },
+
+  async startTextTo3dJob(
+    projectId: string,
+    prompt: string,
+    extraParams?: Record<string, unknown>
+  ): Promise<Job> {
+    return this.startProceduralJob(
+      projectId,
+      {
+        prompt,
+        ...(extraParams || {}),
+      },
+      'text_to_3d'
+    );
+  },
+
+  async uploadReferenceImage(projectId: string, file: File): Promise<ReferenceImageUploadResponse> {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/images`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      throw new Error(await parseApiError(res, 'Falha ao enviar imagem de referência'));
+    }
+    return res.json();
+  },
+
+  async startImageTo3dJob(projectId: string, params: ImageTo3dJobParams): Promise<Job> {
+    return this.startProceduralJob(projectId, params, 'image_to_3d');
   },
 
   async getJob(jobId: string): Promise<Job> {
@@ -156,6 +252,15 @@ export const apiService = {
   },
 
   /**
+   * Bloco 7 / 8: Constrói a URL contextual segura para exibição da imagem de referência do projeto:
+   * `/api/v1/projects/{project_id}/images/{filename}`
+   */
+  getReferenceImageUrl(projectId: string, filenameOrRelativePath: string): string {
+    const filename = extractFilenameFromPath(filenameOrRelativePath);
+    return `${API_BASE}/projects/${encodeURIComponent(projectId)}/images/${encodeURIComponent(filename)}`;
+  },
+
+  /**
    * Mantido apenas para compatibilidade caso um caminho relativo completo `projects/{project_id}/{filename}`
    * seja passado; extrai `project_id` e `filename` e direciona para a rota contextual segura.
    */
@@ -174,4 +279,3 @@ export const apiService = {
     return `${API_BASE}/files/download?path=${encodeURIComponent(relativePath)}`;
   },
 };
-

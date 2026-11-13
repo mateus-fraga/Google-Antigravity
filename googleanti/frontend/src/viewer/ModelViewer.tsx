@@ -1,9 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ThreeViewer, type MeshTelemetryInfo } from './ThreeViewer';
+import type { JobMetadata } from '../services/api';
 
 interface ModelViewerProps {
   modelUrl: string | null;
   coordinateSystem?: 'Y-up' | 'legacy_z_up';
+  jobMetadata?: JobMetadata | null;
   onMeshLoaded?: (info: MeshTelemetryInfo) => void;
   onViewerError?: (message: string | null) => void;
   viewerRef?: React.MutableRefObject<ThreeViewer | null>;
@@ -12,6 +14,7 @@ interface ModelViewerProps {
 export const ModelViewer: React.FC<ModelViewerProps> = ({
   modelUrl,
   coordinateSystem = 'Y-up',
+  jobMetadata,
   onMeshLoaded,
   onViewerError,
   viewerRef,
@@ -66,6 +69,11 @@ export const ModelViewer: React.FC<ModelViewerProps> = ({
     }
   }, [modelUrl, coordinateSystem]);
 
+  const parsedIntent = typeof jobMetadata?.parsed_intent === 'string' ? jobMetadata.parsed_intent : null;
+  const imageMode = typeof jobMetadata?.image_to_3d_mode === 'string' ? jobMetadata.image_to_3d_mode : null;
+  const componentsCount =
+    typeof jobMetadata?.detected_components_count === 'number' ? jobMetadata.detected_components_count : null;
+
   return (
     <div
       style={{
@@ -85,6 +93,38 @@ export const ModelViewer: React.FC<ModelViewerProps> = ({
           minHeight: '450px',
         }}
       />
+      {(parsedIntent || imageMode) && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: '16px',
+            left: '16px',
+            padding: '6px 10px',
+            background: '#18181bcc',
+            backdropFilter: 'blur(4px)',
+            border: '1px solid #3f3f46',
+            borderRadius: '6px',
+            color: '#e4e4e7',
+            fontSize: '11px',
+            zIndex: 15,
+            display: 'flex',
+            gap: '8px',
+            alignItems: 'center',
+          }}
+        >
+          {parsedIntent && (
+            <span>
+              <strong>Text-to-3D:</strong> {parsedIntent}
+              {componentsCount !== null ? ` (${componentsCount} comp.)` : ''}
+            </span>
+          )}
+          {imageMode && (
+            <span>
+              <strong>Image-to-3D:</strong> {imageMode === 'heightmap' ? 'Relevo (Heightmap)' : 'Silhueta 2D'}
+            </span>
+          )}
+        </div>
+      )}
       {viewerError && (
         <div
           style={{
@@ -107,4 +147,3 @@ export const ModelViewer: React.FC<ModelViewerProps> = ({
     </div>
   );
 };
-

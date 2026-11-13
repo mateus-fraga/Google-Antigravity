@@ -814,3 +814,104 @@ Com a entrega do Bloco 5, todos os 5 blocos do plano de estabilização foram in
 - **Bloco 3 (GEO-001):** Validação estrita de parâmetros finitos, alinhamento Y-up e compatibilidade retroativa.
 - **Bloco 4 (MEM-001 / UI-001):** Descarte profundo de recursos WebGL, indicadores de eixos Y-up, exportação multiformato (GLB, OBJ, STL) e UI responsiva.
 - **Bloco 5:** Suíte ponta a ponta (E2E), scripts facilitadores de inicialização, zero warnings de linter e roteiro de aceitação visual.
+
+---
+
+## Entrada 11 — Implementação e Validação do Bloco 6 — Motor Text-to-3D e Composição Geométrica Multi-Componente
+- **Data:** 2026-11-12
+- **Mudança OpenSpec:** `add-multimodal-text-and-image-to-3d`
+- **Branch Git:** `developing`
+- **Escopo:** Bloco 6 — Tarefas 6.1, 6.2, 6.3 e 6.4
+- **Status:** Implementado, Testado e Validado (`73 passed`, OpenSpec `valid`)
+
+---
+
+### 1. Resumo Arquitetural e Técnico (Tarefas 6.1 a 6.4)
+
+| Tarefa | Arquivo(s) | Funções / Classes Alteradas | Descrição Técnica |
+| :--- | :--- | :--- | :--- |
+| **6.1** | `openspec/changes/add-multimodal-text-and-image-to-3d/*` | `proposal.md`, `design.md`, `tasks.md`, `specs/text-to-3d/spec.md`, `specs/image-to-3d/spec.md` | Estruturação completa da nova mudança OpenSpec `add-multimodal-text-and-image-to-3d` organizando os Blocos 6 (Text-to-3D e Composição Multi-Componente), 7 (Image-to-3D Local) e 8 (Interface Multimodal Integrada). |
+| **6.2** | `backend/app/procedural/engine.py`, `backend/app/schemas/geometry.py` | `ProceduralGenerator.generate_from_ir`, `_build_single_component_meshes`, `_parse_color_to_rgba`, `Transformation`, `MaterialDef`, `IntermediateObjectRepresentation` | Implementação do compositor multi-componente Y-up `generate_from_ir(ir, align_to_ground=True)` com suporte a múltiplos objetos `Component`, hierarquia `children`, aplicação determinística de `scale`, `rotation` (Euler em graus convertida para matriz 4x4) e `position`/`translation` (em metros), atribuição de cores `visual.vertex_colors` a partir de `MaterialDef.base_color`/`color`, concatenação em malha única, assentamento no plano XZ ($Y_{\min} = 0.0$) e validação topológica/numérica via `_finalize_and_verify_mesh`. |
+| **6.3** | `backend/app/procedural/text_to_3d.py` | `TextTo3DGenerator` (`validate_prompt`, `parse_prompt_to_ir`, `generate_from_prompt`) | Criação do interpretador semântico bilíngue (PT-BR e EN) capaz de extrair intenção (`parsed_intent`), converter unidades métricas (`m`, `cm`, `mm` $\to$ metros), identificar contagens inteiras (`num_teeth`), detectar cores/materiais (`dourado`, `metálico`, `madeira`, `vermelho`, `azul`, códigos hexadecimais) e decompor objetos simples e compostos (`table` com 5 componentes, `tower` com cilindro e topo cônico, `dumbbell` com eixo horizontal e esferas/cilindros nas pontas, `pillar` com base, coluna e capitel, `gear`, `box`, `wall`, `cylinder`, `sphere`, `cone`, `torus`) em uma instância validada de `IntermediateObjectRepresentation`. Rejeição determinística de prompts vazios, `> 2000` caracteres ou com medidas negativas/nulas/inválidas. |
+| **6.4** | `backend/app/schemas/jobs.py`, `backend/app/jobs/orchestrator.py`, `backend/app/api/routes.py`, `backend/tests/test_text_to_3d.py` | `JobCreate.validate_job_parameters`, `JobOrchestrator._execute_procedural_pipeline_sync`, `JobOrchestrator.run_procedural_job_async`, `test_text_to_3d.py` | Integração de `operation_type="text_to_3d"` na validação de entrada `JobCreate` (retornando HTTP 422 para prompts inválidos) e no worker síncrono executado via `asyncio.to_thread` com todos os checkpoints de cancelamento cooperativo (`check_cancel`), exportação `.glb` validada e persistência dos metadados semânticos (`parsed_intent`, `detected_components_count`, `extracted_dimensions`, `prompt`) no job e no projeto. Criação da suíte `backend/tests/test_text_to_3d.py` com 11 casos de teste. |
+
+---
+
+### 2. Comandos Executados e Resultados Reais
+
+1. **Nova Suíte Text-to-3D (`test_text_to_3d.py`):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend/tests/test_text_to_3d.py -v`
+   - Resultado: **11 aprovados (`11 passed`), 0 falhas** em `2.73s`.
+2. **Suíte Completa do Backend (Regressão Blocos 1 a 5 + Bloco 6):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend/tests -v`
+   - Resultado: **73 aprovados (`73 passed`), 0 falhas** em `9.55s`.
+3. **Validação Estrita OpenSpec (`add-multimodal-text-and-image-to-3d`):**
+   - Comando: `npx openspec validate --strict add-multimodal-text-and-image-to-3d`
+   - Resultado: **`Change 'add-multimodal-text-and-image-to-3d' is valid`** (`0` erros, `0` avisos).
+
+---
+
+## Entrada 12 — Implementação e Validação do Bloco 7 — Motor Image-to-3D Local (Extrusão de Silhueta e Relevo) e Upload Seguro de Imagens
+- **Data:** 2026-11-12
+- **Mudança OpenSpec:** `add-multimodal-text-and-image-to-3d`
+- **Branch Git:** `developing`
+- **Escopo:** Bloco 7 — Tarefas 7.1, 7.2, 7.3 e 7.4
+- **Status:** Implementado, Testado e Validado (`76 passed`, OpenSpec `valid`)
+
+---
+
+### 1. Resumo Arquitetural e Técnico (Tarefas 7.1 a 7.4)
+
+| Tarefa | Arquivo(s) | Funções / Classes Alteradas | Descrição Técnica |
+| :--- | :--- | :--- | :--- |
+| **7.1** | `backend/app/api/routes.py`, `backend/app/procedural/image_to_3d.py`, `backend/app/storage/database.py` | `upload_project_reference_image` (`POST /api/v1/projects/{project_id}/images`), `get_project_reference_image` (`GET /api/v1/projects/{project_id}/images/{filename}`), `validate_uploaded_image_bytes` | Implementação de upload seguro e contextual de imagens de referência (`PNG`, `JPG`/`JPEG`, `WEBP`). Validação estrita de limite de tamanho (`MAX_UPLOAD_SIZE = 10 MB`), inspeção de magic bytes binários reais, decodificação completa via Pillow (`verify()` + `load()`), verificação de correspondência entre extensão e assinatura binária, e rejeição imediata de SVG/XML, HTML, scripts, PDFs e executáveis (`MZ`/`ELF`). Gravação atômica em `STORAGE_DIR/{project_id}/ref_image_{uuid}.{ext}` e rastreabilidade em `metadata_json`/`parameters_json` do projeto no SQLite. Endpoint `GET` protegido contra symlinks, traversal e acesso cruzado entre projetos. |
+| **7.2** | `backend/app/procedural/image_to_3d.py` | `ImageTo3DGenerator.generate_from_silhouette`, `_extract_binary_mask` | Extração de máscara binária via canal Alpha (quando transparente) ou limiarização de Otsu com detecção automática de bordas claras/escuras. Extração hierárquica de contornos e furos internos com `cv2.findContours(..., cv2.RETR_CCOMP, ...)`, construção de `shapely.geometry.Polygon(shell, holes)`, suavização topológica via `simplify`, normalização proporcional na caixa $1.0 \times 1.0\text{m}$, extrusão sólida via `trimesh.creation.extrude_polygon(height=thickness)` e rotação para **Y-up** ($Y_{\min} = 0.0, Y_{\max} = \text{thickness}$). |
+| **7.3** | `backend/app/procedural/image_to_3d.py` | `ImageTo3DGenerator.generate_from_heightmap` | Conversão da imagem em mapa de luminância em tons de cinza subamostrado (`max_grid_size = 128`), cálculo de $Y_{x,z} = \text{base\_thickness} + (\text{luminância} \times \text{relief\_depth})$ e triangulação vetorizada em duas camadas correspondentes (topo + base plana em $Y = 0.0$ na mesma grelha, sem T-junctions) fechadas pelas 4 paredes perimetrais, garantindo malha 100% estanque (`is_watertight == True`) em convenção Y-up. |
+| **7.4** | `backend/app/schemas/jobs.py`, `backend/app/jobs/orchestrator.py`, `backend/tests/test_image_to_3d.py`, `backend/requirements.txt` | `JobCreate.validate_job_parameters`, `JobOrchestrator._execute_procedural_pipeline_sync`, `test_image_to_3d.py` | Integração de `operation_type="image_to_3d"` (`mode="silhouette"` e `mode="heightmap"`) no schema `JobCreate` e no worker síncrono executado via `asyncio.to_thread` com checkpoints cooperativos (`check_cancel`), exportação `.glb` validada e persistência dos metadados no job e no projeto. Criação de `backend/tests/test_image_to_3d.py` validando segurança de upload, geração estanque Y-up e ciclo assíncrono completo. |
+
+---
+
+### 2. Comandos Executados e Resultados Reais
+
+1. **Nova Suíte Image-to-3D (`test_image_to_3d.py`):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend/tests/test_image_to_3d.py -v`
+   - Resultado: **3 aprovados (`3 passed`), 0 falhas** em `3.21s`.
+2. **Suíte Completa do Backend (Regressão Blocos 1 a 6 + Bloco 7):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend/tests -v`
+   - Resultado: **76 aprovados (`76 passed`), 0 falhas** em `10.12s`.
+3. **Validação Estrita OpenSpec (`add-multimodal-text-and-image-to-3d`):**
+   - Comando: `npx openspec validate --strict add-multimodal-text-and-image-to-3d`
+   - Resultado: **`Change 'add-multimodal-text-and-image-to-3d' is valid`** (`0` erros, `0` avisos).
+
+---
+
+## Entrada 13 — Implementação e Validação do Bloco 8 — Interface Multimodal Integrada (Procedural, Text-to-3D e Image-to-3D) e Aceitação E2E
+- **Data:** 2026-11-12
+- **Mudança OpenSpec:** `add-multimodal-text-and-image-to-3d`
+- **Branch Git:** `developing`
+- **Escopo:** Bloco 8 — Tarefas 8.1, 8.2, 8.3 e 8.4
+- **Status:** Implementado, Testado e Validado (`77 passed`, `0 warnings / 0 errors` no `oxlint`, OpenSpec `valid`)
+
+---
+
+### 1. Resumo Arquitetural e Técnico (Tarefas 8.1 a 8.4)
+
+| Tarefa | Arquivo(s) | Funções / Componentes Alterados | Descrição Técnica |
+| :--- | :--- | :--- | :--- |
+| **8.1** | `frontend/src/services/api.ts` | `apiService.startProceduralJob`, `apiService.startTextTo3dJob`, `apiService.uploadReferenceImage`, `apiService.startImageTo3dJob`, `apiService.getReferenceImageUrl`, `JobMetadata`, `ReferenceImageUploadResponse`, `ImageTo3dJobParams` | Evolução do cliente HTTP da API com suporte tipado a `operation_type` (`procedural_generation`, `text_to_3d`, `image_to_3d`), método de upload `multipart/form-data` para imagens de referência (`POST /api/v1/projects/{project_id}/images`), helper de URL contextual segura para exibição da imagem (`GET /api/v1/projects/{project_id}/images/{filename}`) e tipagem dos metadados semânticos e de imagem. |
+| **8.2 / 8.3 / 8.4** | `frontend/src/features/generation/GenerationPanel.tsx`, `frontend/src/App.tsx`, `frontend/src/viewer/ModelViewer.tsx` | `GenerationPanel` (3 Abas), `App` (`handleGenerateTextTo3D`, `handleGenerateImageTo3D`), `ModelViewer` (`jobMetadata`) | Transformação do `GenerationPanel.tsx` em interface de 3 abas (`Procedural`, `Texto p/ 3D`, `Imagem p/ 3D`) com bloqueio `disabled={isLoading}` em todos os controles: (1) Aba Procedural paramétrica preservada; (2) Aba Texto para 3D com `<textarea>` e 4 templates rápidos clicáveis em PT-BR; (3) Aba Imagem para 3D com `<input type="file" accept="image/png, image/jpeg, image/webp">`, miniatura instantânea via `URL.createObjectURL(file)` com revogação segura de memória (`URL.revokeObjectURL`), seletor de modo (`silhouette` vs `heightmap`) e ajustes dedicados (`thickness`/`resolution_scale` ou `relief_depth`/`base_thickness`). Exibição de telemetria semântica (`parsed_intent`, `detected_components_count`, `extracted_dimensions`, `detected_color`) e de Image-to-3D (`image_to_3d_mode`, miniatura `reference_image_filename`) no painel lateral de `App.tsx` e no overlay de `ModelViewer.tsx`. |
+| **8.3 (E2E)** | `backend/tests/test_e2e.py`, `backend/app/jobs/orchestrator.py` | `test_multimodal_text_and_image_to_3d_e2e_workflow`, `JobOrchestrator.run_procedural_job_async` | Ampliação da suíte de aceitação E2E validando o fluxo integrado completo: criação de projeto, geração Text-to-3D composta, exportação multiformato (`GLB`, `OBJ`, `STL`), upload e leitura segura de imagem PNG, geração Image-to-3D e limpeza final. Preservação cumulativa de `reference_images` em `parameters_json` entre múltiplos jobs do mesmo projeto. |
+
+---
+
+### 2. Comandos Executados e Resultados Reais
+
+1. **Build de Produção e Linter do Frontend:**
+   - Comando: `cd frontend && npm run build && npm run lint`
+   - Resultado: **`✓ built in 1.18s`** (`0` erros TypeScript) e **`Found 0 warnings and 0 errors`** no `oxlint`.
+2. **Suíte Completa do Backend (`pytest`):**
+   - Comando: `set PYTHONPATH=. && backend\venv\Scripts\pytest backend/tests -v`
+   - Resultado: **77 aprovados (`77 passed`), 0 falhas** em `8.71s`.
+3. **Validação Estrita OpenSpec (`add-multimodal-text-and-image-to-3d`):**
+   - Comando: `npx openspec validate --strict add-multimodal-text-and-image-to-3d`
+   - Resultado: **`Change 'add-multimodal-text-and-image-to-3d' is valid`** (`0` erros, `0` avisos).
