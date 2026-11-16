@@ -1,105 +1,104 @@
-# AI 3D Studio
+# AI 3D Studio
 
-> **AI 3D Studio** – um conjunto de ferramentas para modelagem procedural e processamento 3‑D impulsionado por IA.
+> **AI 3D Studio** – Plataforma 100% local para geração, reconstrução e inspeção 3D multimodal (**Procedural**, **Text-to-3D** e **Image-to-3D / TripoSR**) em convenção nativa **Y-up** (`glTF 2.0` / `Three.js`).
 
-## Visão geral
-Este repositório contém a implementação completa de um _studio_ de modelagem 3‑D baseado em inteligência artificial. Ele está dividido em três partes principais:
+---
 
-- **Backend** – API em FastAPI que expõe funcionalidades de geração e manipulação procedural de geometria, além de serviços auxiliares (persistência, validação, etc.).
-- **Frontend** – Aplicação React + TypeScript (Vite) que fornece a interface de usuário para criar, visualizar e exportar modelos.
-- **Documentação** – Guia de arquitetura, tutoriais de uso e relatórios de validação geométrica (`docs/`).
+## Principais Funcionalidades
 
-O objetivo é oferecer um fluxo de trabalho inteiro, desde a criação automática de objetos 3‑D até a sua inspeção e exportação, tudo controlado por chamadas de API e uma UI responsiva.
+1. **Geração Procedural Paramétrica (`procedural_generation`):**
+   - Primitivas e objetos mecânicos/mobiliário (`gear`, `box`, `cylinder`, `table`, `sphere`, `cone`, `torus`) com validação numérica estrita e alinhamento no plano de solo $XZ$ ($Y_{\min} = 0.0$).
+2. **Motor Semântico Text-to-3D (`text_to_3d`):**
+   - Interpretador bilíngue (PT-BR / EN) com conversão automática de unidades métricas (`m`, `cm`, `mm`), detecção de materiais/cores e composição multi-componente hierárquica (`IntermediateObjectRepresentation`).
+3. **Motor Image-to-3D Local (`image_to_3d`):**
+   - **Extrusão de Silhueta 2D (`silhouette`):** Extração de contornos e furos internos via OpenCV (`RETR_CCOMP`) + Shapely.
+   - **Mapa de Relevo (`heightmap`):** Malha 3D estanque (`watertight`) gerada por luminância com base sólida e paredes fechadas.
+   - **Reconstrução Orgânica Neural (`triposr`):** Integração nativa com o **TripoSR (`stabilityai/TripoSR`)**, remoção automática de fundo (`rembg`), extração por Marching Cubes com cores de vértice e higienização topológica/normais via Trimesh.
+4. **Visualizador 3D WebGL (Three.js) e Exportação Multiformato:**
+   - 7 vistas de câmera predefinidas, modo sólido/aramado, indicadores de eixos Y-up, telemetria em tempo real, cancelamento cooperativo de tarefas e exportação validada em **`.GLB`**, **`.OBJ`** e **`.STL`**.
 
-## Estrutura do repositório
-```
-googleanti/
-├─ backend/          # Código FastAPI
-│   └─ app/          # Rotas, configuração, inicialização
-├─ frontend/         # Aplicação React + Vite
-│   ├─ src/          # Componentes, hooks, estilos
-│   └─ public/       # Arquivos estáticos
-├─ docs/              # Documentação do projeto
-├─ .agents/          # Agentes Antigravity (skills, workflows)
-├─ .env.example      # Exemplo de variáveis de ambiente
-└─ README.md         # Este arquivo
-```
+---
 
-## Pré‑requisitos
-- **Python ≥ 3.10** (recomendado 3.11)
-- **Node.js ≥ 18** e **npm** ou **pnpm**
-- **Poetry** (gerenciador de dependências Python) – opcional, mas recomendado
-- Sistema operacional Windows (conforme ambiente atual)
+## Inicialização Rápida (Comando Único)
 
-## Configuração e execução
+Você pode subir todo o ambiente de desenvolvimento (Backend FastAPI + Frontend React/Vite) com um único comando através dos scripts facilitadores em `execs/` (ou `scripts/`):
 
-### Inicialização Rápida (Comando Único — Recomendado)
-Para iniciar simultaneamente o **Backend (FastAPI na porta 8000)** e o **Frontend (Vite na porta 5173)** com verificação e instalação automática de `backend/venv` e `frontend/node_modules`:
-
-**Windows (PowerShell, CMD ou duplo clique no Explorer):**
-```powershell
-cd googleanti
-.\execs\start_dev.bat
-```
-*(Também disponível em `.\scripts\start_dev.bat`.)*
-
-**Linux / macOS / Git Bash:**
+### Linux / macOS / Git Bash
 ```bash
-cd googleanti
 chmod +x ./execs/start_dev.sh
 ./execs/start_dev.sh
 ```
 *(Também disponível em `./scripts/start_dev.sh`.)*
 
-- **Frontend (UI)**: `http://127.0.0.1:5173`
-- **Backend (API)**: `http://127.0.0.1:8000`
-- **Swagger Docs**: `http://127.0.0.1:8000/docs`
-- Para encerrar os serviços, pressione `CTRL+C` (ou pressione qualquer tecla na janela controladora do `start_dev.bat`).
-- Para rodar toda a suíte de testes automatizados no Windows com um clique, execute `.\execs\run_tests.bat`.
+### Windows
+```powershell
+.\execs\start_dev.bat
+```
+*(Ou dê duplo clique em `execs\start_dev.bat` pelo Windows Explorer. Também disponível em `.\scripts\start_dev.bat`.)*
+
+### O que os scripts fazem automaticamente:
+1. Verificam se o ambiente virtual Python (`backend/venv`) existe; caso não exista, criam o `venv` e instalam as dependências de `backend/requirements.txt`.
+2. Verificam se as dependências do frontend (`frontend/node_modules`) estão instaladas; caso não estejam, executam `npm install`.
+3. Iniciam simultaneamente:
+   - **Backend FastAPI**: `http://127.0.0.1:8000` (Documentação Swagger: `http://127.0.0.1:8000/docs`)
+   - **Frontend Vite**: `http://127.0.0.1:5173`
+4. Permitem encerrar ambos os servidores de forma limpa (`CTRL+C` no terminal ou pressionando qualquer tecla na janela controladora do `.bat`).
 
 ---
 
-### Execução Manual — Backend
-```bash
-# Crie um ambiente virtual (ex.: venv)
-python -m venv backend/venv
-source backend/venv/Scripts/activate   # PowerShell: .\backend\venv\Scripts\Activate.ps1
+## Configuração da Aceleração GPU para o TripoSR (Opcional)
 
-# Instale as dependências
+A arquitetura `tsr` do TripoSR já está integrada diretamente ao repositório em `backend/app/lrm/tsr/` com fallback automático para `PyMCubes`. Para instalar o PyTorch com suporte a **CUDA 12.8** (incluindo GPUs série RTX 50 / Blackwell) em uma nova máquina:
+
+```bash
+source backend/venv/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install -r backend/requirements.txt
-
-# Copie as variáveis de ambiente
-copy .env.example .env
-# Ajuste .env conforme necessário (por ex., portas, chaves de API)
-
-# Inicie a API
-uvicorn backend.app.main:app --reload
 ```
-A API ficará disponível em `http://localhost:8000`. A documentação automática pode ser acessada em `http://localhost:8000/docs` (Swagger) ou `http://localhost:8000/redoc`.
+Consulte o guia detalhado em [`docs/TRIPOSR_INSTALL.md`](docs/TRIPOSR_INSTALL.md).
 
-### Frontend
+---
+
+## Execução da Suíte de Testes
+
+### Linux / macOS
 ```bash
-cd frontend
-npm install   # ou pnpm install
-npm run dev   # inicia Vite dev server
+# Backend (83 testes automatizados)
+PYTHONPATH=. ./backend/venv/bin/pytest backend/tests -v
+
+# Frontend (Linter + TypeScript + Vite build)
+cd frontend && npm run lint && npm run build
 ```
-O cliente será servido em `http://localhost:5173` (ou outra porta indicada).
 
-## Documentação
-A pasta `docs/` contém:
-- **Visão da arquitetura** – diagramas de componentes e fluxos de dados.
-- **Guia de usuário** – como usar a UI, gerar modelos, exportar arquivos.
-- **Relatórios de validação** – testes de integridade geométrica.
+### Windows
+```powershell
+.\execs\run_tests.bat
+```
+Ou manualmente no PowerShell:
+```powershell
+$env:PYTHONPATH="."; .\backend\venv\Scripts\python.exe -m pytest backend/tests -v
+cd frontend; npm run lint; npm run build
+```
 
-Visite `docs/README.md` para mais detalhes.
+---
 
-## Contribuição
-1. Fork este repositório.
-2. Crie uma branch para sua feature ou correção (`git checkout -b feature/xyz`).
-3. Teste as mudanças localmente (backend + frontend).
-4. Abra um Pull Request descrevendo a mudança.
+## Estrutura do Projeto
 
-Para questões de estilo e lint, o backend usa **flake8** e o frontend **oxlint**/ESLint. Os scripts de CI podem ser encontrados em `.github/workflows/` (se houver).
-
-## Licença
-Este projeto está licenciado sob a **MIT License** – veja o arquivo `LICENSE` para detalhes.
+```text
+googleanti/
+├─ backend/
+│  ├─ app/
+│  │  ├─ api/          # Rotas FastAPI, upload/download contextual seguro e quarentena
+│  │  ├─ exporters/    # Exportação e validação round-trip (GLB, OBJ, STL)
+│  │  ├─ jobs/         # JobOrchestrator assíncrono e cancelamento cooperativo
+│  │  ├─ lrm/          # Motor neural TripoSR (triposr_engine.py + pacote tsr embarcado)
+│  │  ├─ procedural/   # Motores geométricos Y-up, Text-to-3D e Image-to-3D (silhueta/relevo)
+│  │  ├─ schemas/      # Contratos e validações Pydantic
+│  │  └─ storage/      # Persistência SQLite (SQLAlchemy)
+│  └─ tests/           # Suíte completa de 83 testes automatizados (pytest)
+├─ frontend/           # Aplicação React + TypeScript + Three.js (Vite)
+├─ execs/              # Scripts facilitadores (start_dev.sh, start_dev.bat, run_tests.bat)
+├─ scripts/            # Espelho de scripts utilitários
+├─ docs/               # STABILIZATION_CHANGELOG.md, TRIPOSR_INSTALL.md e testes visuais
+└─ openspec/           # Especificações e artefatos OpenSpec
+```
