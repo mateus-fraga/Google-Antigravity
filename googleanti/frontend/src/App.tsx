@@ -490,7 +490,7 @@ export function App() {
                     <div>
                       <strong>Modo Image-to-3D:</strong>{' '}
                       <span style={{ color: '#60a5fa', fontWeight: 600 }}>
-                        {imageTo3dMode === 'heightmap' ? 'Mapa de Relevo (Heightmap)' : 'Extrusão de Silhueta 2D'}
+                        {imageTo3dMode === 'heightmap' ? 'Mapa de Relevo (Heightmap)' : imageTo3dMode === 'triposr' ? 'Reconstrução Orgânica (TripoSR)' : 'Extrusão de Silhueta 2D'}
                       </span>
                     </div>
                     {referenceImageFilename && currentProject && (

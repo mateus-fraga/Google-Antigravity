@@ -585,6 +585,7 @@ export const GenerationPanel: React.FC<GenerationPanelProps> = ({
               >
                 <option value="silhouette">Extrusão de Silhueta 2D + Furos (Alpha / Otsu)</option>
                 <option value="heightmap">Mapa de Relevo / Altura por Luminância (Heightmap)</option>
+                <option value="triposr">Reconstrução Orgânica de Alta Fidelidade (TripoSR)</option>
               </select>
             </div>
 
@@ -617,7 +618,7 @@ export const GenerationPanel: React.FC<GenerationPanelProps> = ({
                   />
                 </div>
               </div>
-            ) : (
+            ) : imageMode === 'heightmap' ? (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                 <div>
                   <label style={{ fontSize: '12px', color: '#a1a1aa' }}>Relevo Y Máx. (m):</label>
@@ -645,6 +646,10 @@ export const GenerationPanel: React.FC<GenerationPanelProps> = ({
                     style={inputStyle}
                   />
                 </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: '11px', color: '#a1a1aa' }}>
+                Inferência neural local (GPU). A primeira execução baixa o modelo e pode demorar.
               </div>
             )}
           </div>

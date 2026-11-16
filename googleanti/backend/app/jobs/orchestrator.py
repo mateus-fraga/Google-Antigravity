@@ -12,6 +12,7 @@ from backend.app.storage.database import SessionLocal, JobModel, ProjectModel
 from backend.app.procedural.engine import ProceduralGenerator
 from backend.app.procedural.text_to_3d import TextTo3DGenerator
 from backend.app.procedural.image_to_3d import ImageTo3DGenerator
+from backend.app.lrm.triposr_engine import TripoSREngine
 from backend.app.exporters.mesh_exporter import ModelExporter
 from backend.app.config import settings
 
@@ -339,7 +340,23 @@ class JobOrchestrator:
                 if not image_path.exists() or not image_path.is_file() or image_path.is_symlink():
                     raise ValueError(f"Imagem de referência '{ref_filename}' não encontrada no projeto {project_id}.")
                 mode = str(params.get("mode", "silhouette")).strip().lower()
-                if mode == "heightmap":
+                if mode == "triposr":
+                    mcubes_res = int(params.get("mcubes_resolution", TripoSREngine.DEFAULT_MCUBES_RESOLUTION))
+                    rem_bg = bool(params.get("remove_background", True))
+                    engine = TripoSREngine.get_instance()
+                    mesh = engine.generate_mesh_from_image(
+                        image_path=image_path,
+                        mcubes_resolution=mcubes_res,
+                        remove_background=rem_bg,
+                        cancel_check=check_cancel,
+                    )
+                    semantic_metadata = {
+                        "image_to_3d_mode": "triposr",
+                        "reference_image_filename": ref_filename,
+                        "mcubes_resolution": mcubes_res,
+                        "remove_background": rem_bg,
+                    }
+                elif mode == "heightmap":
                     base_t = float(params.get("base_thickness", 0.05))
                     relief_d = float(params.get("relief_depth", 0.15))
                     mesh = ImageTo3DGenerator.generate_from_heightmap(

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 from backend.app.schemas.geometry import (
     validate_procedural_parameters_dict,
     _ensure_finite_number,
+    _ensure_strict_int,
     MIN_DIMENSION,
     MAX_DIMENSION,
 )
@@ -97,6 +98,10 @@ class JobCreate(BaseModel):
                 if rscale < 0.05 or rscale > 4.0:
                     raise ValueError("O parâmetro 'resolution_scale' deve estar entre 0.05 e 4.0.")
                 cleaned_params["resolution_scale"] = rscale
+            if "mcubes_resolution" in cleaned_params and cleaned_params["mcubes_resolution"] is not None:
+                cleaned_params["mcubes_resolution"] = _ensure_strict_int(
+                    cleaned_params["mcubes_resolution"], "mcubes_resolution", 32, 512
+                )
             self.params = cleaned_params
         return self
 

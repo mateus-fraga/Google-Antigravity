@@ -120,7 +120,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = ({
           )}
           {imageMode && (
             <span>
-              <strong>Image-to-3D:</strong> {imageMode === 'heightmap' ? 'Relevo (Heightmap)' : 'Silhueta 2D'}
+              <strong>Image-to-3D:</strong> {imageMode === 'heightmap' ? 'Relevo (Heightmap)' : imageMode === 'triposr' ? 'TripoSR (Orgânico)' : 'Silhueta 2D'}
             </span>
           )}
         </div>

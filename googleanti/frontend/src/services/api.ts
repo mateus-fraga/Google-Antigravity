@@ -2,7 +2,7 @@ const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
 export type SupportedExportFormat = 'glb' | 'obj' | 'stl';
 export type GenerationOperationType = 'procedural_generation' | 'text_to_3d' | 'image_to_3d';
-export type ImageTo3dMode = 'silhouette' | 'heightmap';
+export type ImageTo3dMode = 'silhouette' | 'heightmap' | 'triposr';
 
 export interface Project {
   id: string;

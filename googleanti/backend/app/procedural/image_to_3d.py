@@ -142,7 +142,7 @@ class ImageTo3DGenerator:
        estanque (`is_watertight == True`).
     """
 
-    SUPPORTED_MODES = {"silhouette", "heightmap"}
+    SUPPORTED_MODES = {"silhouette", "heightmap", "triposr"}
 
     @classmethod
     def _load_validated_pil_image(cls, image_path: Path) -> Image.Image:
