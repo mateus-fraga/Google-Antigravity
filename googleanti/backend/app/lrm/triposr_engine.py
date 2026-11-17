@@ -76,17 +76,29 @@ class TripoSREngine:
             return cls._instance
 
     def _remove_background(self, image: Image.Image) -> Image.Image:
+        from tsr.utils import resize_foreground
+
         try:
             import rembg
-            from tsr.utils import resize_foreground
-        except ImportError as exc:
-            raise TripoSRUnavailableError(
-                "rembg não instalado (pip install rembg onnxruntime)."
-            ) from exc
 
-        if self._rembg_session is None:
-            self._rembg_session = rembg.new_session()
-        rgba = rembg.remove(image.convert("RGB"), session=self._rembg_session)
+            if self._rembg_session is None:
+                self._rembg_session = rembg.new_session()
+            rgba = rembg.remove(image.convert("RGB"), session=self._rembg_session)
+        except ImportError:
+            logger.warning(
+                "rembg não disponível neste ambiente Python; utilizando segmentação local OpenCV/Alpha como fallback."
+            )
+            if image.mode == "RGBA" and image.getextrema()[3][0] < 255:
+                rgba = image
+            else:
+                from backend.app.procedural.image_to_3d import ImageTo3DGenerator
+
+                rgb_img = image.convert("RGBA")
+                mask = ImageTo3DGenerator._extract_binary_mask(rgb_img)
+                rgba_arr = np.asarray(rgb_img).copy()
+                rgba_arr[:, :, 3] = mask
+                rgba = Image.fromarray(rgba_arr, mode="RGBA")
+
         rgba = resize_foreground(rgba, self.FOREGROUND_RATIO)
         arr = np.asarray(rgba).astype(np.float32) / 255.0
         arr = arr[:, :, :3] * arr[:, :, 3:4] + (1.0 - arr[:, :, 3:4]) * 0.5
@@ -164,4 +176,11 @@ class TripoSREngine:
         if componentes:
             mesh = max(componentes, key=lambda m: len(m.faces))
 
+        # 5. Converter da convenção nativa do TripoSR (Z-up, frente em +X) para Y-up (frente em +Z)
+        rot_x = trimesh.transformations.rotation_matrix(np.radians(-90.0), [1.0, 0.0, 0.0])
+        rot_y = trimesh.transformations.rotation_matrix(np.radians(90.0), [0.0, 1.0, 0.0])
+        mesh.apply_transform(rot_x)
+        mesh.apply_transform(rot_y)
+
+        # 6. Escalar para 1.0m, centralizar XZ na origem e assentar a base no chão (Y_min = 0.0)
         return self._normalize_mesh(mesh)

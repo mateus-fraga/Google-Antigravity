@@ -12,15 +12,20 @@ except ImportError:
 
 def _pymcubes_fallback(vol: torch.Tensor, thresh: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Fallback automático para PyMCubes (`mcubes.marching_cubes`) quando `torchmcubes`
-    não está compilado no ambiente. Mantém a mesma convenção de eixos (x, y, z) e
-    orientação de faces esperada por `MarchingCubeHelper.forward`.
+    Fallback automático para PyMCubes (`mcubes.marching_cubes`) ou `scikit-image`
+    (`skimage.measure.marching_cubes`) quando `torchmcubes` não está compilado no ambiente.
+    Mantém a mesma convenção de eixos (x, y, z) e orientação de faces esperada por
+    `MarchingCubeHelper.forward`.
     """
-    import mcubes
-
     vol_np = np.asarray(vol.detach().cpu().numpy(), dtype=np.float32)
-    verts, faces = mcubes.marching_cubes(vol_np, float(thresh))
-    # PyMCubes retorna vértices em (axis0=z, axis1=y, axis2=x); inverter para (x, y, z)
+    try:
+        import mcubes
+        verts, faces = mcubes.marching_cubes(vol_np, float(thresh))
+    except ImportError:
+        from skimage import measure
+        verts, faces, _, _ = measure.marching_cubes(vol_np, level=float(thresh))
+
+    # PyMCubes / skimage retornam vértices em (axis0=z, axis1=y, axis2=x); inverter para (x, y, z)
     # pois `MarchingCubeHelper.forward` aplica `v_pos = v_pos[..., [2, 1, 0]]` em seguida.
     verts_xyz = np.ascontiguousarray(verts[:, [2, 1, 0]], dtype=np.float32)
     faces_fixed = np.ascontiguousarray(faces.astype(np.int64))

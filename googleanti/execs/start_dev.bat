@@ -27,18 +27,30 @@ if %ERRORLEVEL% neq 0 (
 )
 
 :: 2. Verificar/Criar ambiente virtual Python (backend/venv)
-if not exist "%ROOT_DIR%\backend\venv\Scripts\python.exe" (
-    echo [SETUP] Ambiente virtual Python nao encontrado em backend\venv. Criando...
-    python -m venv "%ROOT_DIR%\backend\venv"
-    if %ERRORLEVEL% neq 0 (
+set "VENV_OK=0"
+if exist "%ROOT_DIR%\backend\venv\Scripts\python.exe" (
+    "%ROOT_DIR%\backend\venv\Scripts\python.exe" -c "import sys" >nul 2>&1
+    if !ERRORLEVEL! equ 0 set "VENV_OK=1"
+)
+
+if "!VENV_OK!"=="0" (
+    echo [SETUP] Criando/reparando ambiente virtual Python em backend\venv...
+    if exist "%ROOT_DIR%\backend\venv" rmdir /s /q "%ROOT_DIR%\backend\venv" >nul 2>&1
+    py -3.12 --version >nul 2>&1
+    if !ERRORLEVEL! equ 0 (
+        py -3.12 -m venv "%ROOT_DIR%\backend\venv"
+    ) else (
+        python -m venv "%ROOT_DIR%\backend\venv"
+    )
+    if !ERRORLEVEL! neq 0 (
         echo [ERRO] Falha ao criar ambiente virtual Python.
         pause
         exit /b 1
     )
     echo [SETUP] Instalando dependencias do Backend ^(backend\requirements.txt^)...
     "%ROOT_DIR%\backend\venv\Scripts\python.exe" -m pip install --upgrade pip
-    "%ROOT_DIR%\backend\venv\Scripts\pip.exe" install -r "%ROOT_DIR%\backend\requirements.txt"
-    if %ERRORLEVEL% neq 0 (
+    "%ROOT_DIR%\backend\venv\Scripts\python.exe" -m pip install -r "%ROOT_DIR%\backend\requirements.txt"
+    if !ERRORLEVEL! neq 0 (
         echo [ERRO] Falha ao instalar dependencias do Backend.
         pause
         exit /b 1

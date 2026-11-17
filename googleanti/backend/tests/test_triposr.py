@@ -88,7 +88,69 @@ def test_orchestrator_routes_triposr_mode_and_exports_glb(monkeypatch, tmp_path)
     assert result["inspect_info"]["coordinate_system"] == "Y-up"
 
 
-def test_adapt_checkpoint_for_transformers_v5():
+def _get_torch_or_stub(monkeypatch=None):
+    """
+    Retorna o módulo `torch` real se instalado no ambiente, ou um stub leve compatível
+    (com `no_grad`, `nn.Module`, `FloatTensor`, `LongTensor` e `Tensor`) para que os testes
+    unitários funcionem tanto com PyTorch instalado quanto em ambientes sem GPU/torch.
+    """
+    import contextlib
+
+    try:
+        import torch as real_torch
+        if real_torch is not None:
+            return real_torch
+    except ImportError:
+        pass
+
+    stub_torch = types.ModuleType("torch")
+    stub_torch.no_grad = contextlib.nullcontext
+    stub_torch.Tensor = object
+    stub_torch.FloatTensor = object
+    stub_torch.LongTensor = object
+    stub_torch.float32 = "float32"
+    stub_torch.long = "long"
+
+    stub_cuda = types.SimpleNamespace(
+        is_available=lambda: False,
+        empty_cache=lambda: None,
+    )
+    stub_torch.cuda = stub_cuda
+
+    stub_nn = types.ModuleType("torch.nn")
+
+    class _StubModule:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    stub_nn.Module = _StubModule
+    stub_nn_func = types.ModuleType("torch.nn.functional")
+    stub_nn.functional = stub_nn_func
+    stub_torch.nn = stub_nn
+
+    if monkeypatch is not None:
+        monkeypatch.setitem(sys.modules, "torch", stub_torch)
+        monkeypatch.setitem(sys.modules, "torch.nn", stub_nn)
+        monkeypatch.setitem(sys.modules, "torch.nn.functional", stub_nn_func)
+
+        for opt_mod, attrs in (
+            ("einops", {"rearrange": lambda x, *a, **kw: x}),
+            ("huggingface_hub", {"hf_hub_download": lambda *a, **kw: ""}),
+            ("omegaconf", {"OmegaConf": object, "DictConfig": dict}),
+        ):
+            try:
+                __import__(opt_mod)
+            except ImportError:
+                m = types.ModuleType(opt_mod)
+                for k, v in attrs.items():
+                    setattr(m, k, v)
+                monkeypatch.setitem(sys.modules, opt_mod, m)
+
+    return stub_torch
+
+
+def test_adapt_checkpoint_for_transformers_v5(monkeypatch):
+    _get_torch_or_stub(monkeypatch)
     from backend.app.lrm.tsr.system import TSR
 
     legacy_ckpt = {
@@ -113,7 +175,8 @@ def test_adapt_checkpoint_for_transformers_v5():
 
 def test_generate_mesh_from_image_cleans_normals_degenerates_and_floating_debris(tmp_path):
     from PIL import Image
-    import torch
+
+    torch_mod = _get_torch_or_stub()
 
     img_path = tmp_path / "sample.png"
     Image.new("RGB", (64, 64), (180, 90, 40)).save(img_path)
@@ -136,7 +199,7 @@ def test_generate_mesh_from_image_cleans_normals_degenerates_and_floating_debris
             return [dirty_mesh.copy()]
 
     engine = object.__new__(TripoSREngine)
-    engine._torch = torch
+    engine._torch = torch_mod
     engine.device = "cpu"
     engine.model = FakeModel()
     engine._rembg_session = None
@@ -152,6 +215,61 @@ def test_generate_mesh_from_image_cleans_normals_degenerates_and_floating_debris
     assert cleaned.volume > 0.0
     assert np.isclose(cleaned.bounds[0][1], 0.0)
     assert np.isclose(cleaned.extents.max(), 1.0)
+
+
+def test_generate_mesh_from_image_reorients_z_up_to_y_up_and_grounds_at_y_zero(tmp_path):
+    """
+    Garante que um objeto alongado gerado pelo TripoSR no seu espaço nativo Z-up
+    (ex.: torre/pilar com dimensão maior no eixo Z = 4.0, profundidade X = 1.0, largura Y = 2.0)
+    é rotacionado automaticamente para ficar em pé no eixo vertical Y (altura Y = 1.0m após normalização),
+    com a frente (+X original) apontando para +Z e a base exatamente apoiada no chão (Y_min = 0.0).
+    """
+    from PIL import Image
+
+    torch_mod = _get_torch_or_stub()
+
+    img_path = tmp_path / "tower.png"
+    Image.new("RGB", (64, 64), (120, 140, 180)).save(img_path)
+
+    # Caixa nativa no espaço do TripoSR: X=1.0 (frente-trás), Y=2.0 (largura), Z=4.0 (altura Z-up)
+    z_up_box = trimesh.creation.box(extents=[1.0, 2.0, 4.0])
+
+    class FakeZUpModel:
+        def __call__(self, images, device=None):
+            return ["fake_scene_code"]
+
+        def extract_mesh(self, scene_codes, has_vertex_color=True, resolution=256):
+            return [z_up_box.copy()]
+
+    engine = object.__new__(TripoSREngine)
+    engine._torch = torch_mod
+    engine.device = "cpu"
+    engine.model = FakeZUpModel()
+    engine._rembg_session = None
+
+    oriented = engine.generate_mesh_from_image(
+        img_path,
+        mcubes_resolution=64,
+        remove_background=False,
+    )
+
+    extents = oriented.extents
+    bounds = oriented.bounds
+
+    # Após rot_x(-90°) e rot_y(+90°) + normalização para 1.0m:
+    # - Antigo Z (4.0) vira altura Y -> normalizado para 1.0m
+    # - Antigo Y (2.0) vira largura X -> normalizado para 0.5m
+    # - Antigo X (1.0) vira profundidade Z -> normalizado para 0.25m
+    assert np.isclose(extents[1], 1.0, atol=1e-5)   # Altura vertical Y é o maior eixo (1.0m)
+    assert np.isclose(extents[0], 0.5, atol=1e-5)   # Largura X (0.5m)
+    assert np.isclose(extents[2], 0.25, atol=1e-5)  # Profundidade Z (0.25m)
+
+    # Base apoiada no plano XZ (Y_min = 0.0, Y_max = 1.0) e X/Z centralizados na origem
+    assert np.isclose(bounds[0][1], 0.0, atol=1e-5)
+    assert np.isclose(bounds[1][1], 1.0, atol=1e-5)
+    assert np.isclose(bounds[0][0], -bounds[1][0], atol=1e-5)
+    assert np.isclose(bounds[0][2], -bounds[1][2], atol=1e-5)
+    assert oriented.metadata.get("coordinate_system") == "Y-up"
 
 
 

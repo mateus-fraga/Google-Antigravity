@@ -4,10 +4,16 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import imageio
+try:
+    import imageio
+except ImportError:
+    imageio = None  # type: ignore[assignment]
 import numpy as np
 import PIL.Image
-import rembg
+try:
+    import rembg
+except ImportError:
+    rembg = None  # type: ignore[assignment]
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
