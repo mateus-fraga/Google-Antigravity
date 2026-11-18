@@ -272,4 +272,42 @@ def test_generate_mesh_from_image_reorients_z_up_to_y_up_and_grounds_at_y_zero(t
     assert oriented.metadata.get("coordinate_system") == "Y-up"
 
 
+def test_remove_background_fallback_without_rembg_handles_padding_resize_and_uniform(monkeypatch):
+    from PIL import Image, ImageDraw
+
+    _get_torch_or_stub(monkeypatch)
+    monkeypatch.setitem(sys.modules, "rembg", None)
+
+    engine = object.__new__(TripoSREngine)
+    engine._rembg_session = None
+
+    # 1. Imagem RGB comum (64x64) com objeto escuro em fundo branco (testa remoção do pad de 2px)
+    small_img = Image.new("RGB", (64, 64), (255, 255, 255))
+    ImageDraw.Draw(small_img).rectangle([16, 16, 48, 48], fill=(30, 80, 180))
+    out_small = engine._remove_background(small_img)
+    assert out_small.mode == "RGB"
+    assert out_small.width == out_small.height and out_small.width > 0
+
+    # 2. Imagem RGB grande (800x600 > 512px) onde `_extract_binary_mask` redimensiona a máscara
+    large_img = Image.new("RGB", (800, 600), (250, 250, 250))
+    ImageDraw.Draw(large_img).ellipse([200, 150, 600, 450], fill=(180, 40, 40))
+    out_large = engine._remove_background(large_img)
+    assert out_large.mode == "RGB"
+    assert out_large.width == out_large.height and out_large.width > 0
+
+    # 3. Imagem RGB uniforme (máscara vazia -> fallback para imagem opaca completa sem quebrar resize_foreground)
+    uniform_img = Image.new("RGB", (64, 64), (255, 255, 255))
+    out_uniform = engine._remove_background(uniform_img)
+    assert out_uniform.mode == "RGB"
+    assert out_uniform.width == out_uniform.height and out_uniform.width > 0
+
+    # 4. Imagem RGBA já com transparência preservada
+    rgba_img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    ImageDraw.Draw(rgba_img).rectangle([12, 12, 52, 52], fill=(40, 180, 90, 255))
+    out_rgba = engine._remove_background(rgba_img)
+    assert out_rgba.mode == "RGB"
+    assert out_rgba.width == out_rgba.height and out_rgba.width > 0
+
+
+
 

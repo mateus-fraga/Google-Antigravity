@@ -95,6 +95,16 @@ class TripoSREngine:
 
                 rgb_img = image.convert("RGBA")
                 mask = ImageTo3DGenerator._extract_binary_mask(rgb_img)
+                # `_extract_binary_mask` adiciona borda de 2px e limita a dimensão em [16, 512]
+                if mask.shape[0] > 4 and mask.shape[1] > 4:
+                    mask = mask[2:-2, 2:-2]
+                if mask.shape != (rgb_img.height, rgb_img.width):
+                    mask = np.asarray(
+                        Image.fromarray(mask, mode="L").resize(rgb_img.size, Image.Resampling.NEAREST),
+                        dtype=np.uint8,
+                    )
+                if np.count_nonzero(mask) == 0:
+                    mask = np.full((rgb_img.height, rgb_img.width), 255, dtype=np.uint8)
                 rgba_arr = np.asarray(rgb_img).copy()
                 rgba_arr[:, :, 3] = mask
                 rgba = Image.fromarray(rgba_arr, mode="RGBA")
