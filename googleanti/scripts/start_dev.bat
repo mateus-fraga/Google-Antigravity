@@ -82,10 +82,10 @@ if not exist "%ROOT_DIR%\data" mkdir "%ROOT_DIR%\data"
 :: 5. Iniciar Backend (FastAPI na porta 8000) e Frontend (Vite na porta 5173)
 echo.
 echo [START] Iniciando Backend FastAPI em http://127.0.0.1:8000 ...
-start "AI 3D Studio - Backend (FastAPI :8000)" cmd /k "cd /d ""%ROOT_DIR%"" && set PYTHONPATH=%ROOT_DIR% && ""%ROOT_DIR%\backend\venv\Scripts\python.exe"" -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000"
+start "AI 3D Studio - Backend (FastAPI :8000)" cmd /k "cd /d "%ROOT_DIR%" && set "PYTHONPATH=%ROOT_DIR%" && "%ROOT_DIR%\backend\venv\Scripts\python.exe" -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000"
 
 echo [START] Iniciando Frontend Vite em http://127.0.0.1:5173 ...
-start "AI 3D Studio - Frontend (Vite :5173)" cmd /k "cd /d ""%ROOT_DIR%\frontend"" && npm run dev -- --host 127.0.0.1 --port 5173"
+start "AI 3D Studio - Frontend (Vite :5173)" cmd /k "cd /d "%ROOT_DIR%\frontend" && npm run dev -- --host 127.0.0.1 --port 5173"
 
 echo.
 echo ===================================================
