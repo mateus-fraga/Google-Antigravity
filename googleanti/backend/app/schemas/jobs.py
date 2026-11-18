@@ -15,6 +15,7 @@ from backend.app.procedural.text_to_3d import TextTo3DGenerator
 from backend.app.procedural.image_to_3d import ALLOWED_IMAGE_EXTENSIONS, ImageTo3DGenerator
 
 SUPPORTED_OPERATION_TYPES = {"procedural_generation", "text_to_3d", "image_to_3d"}
+SUPPORTED_IMAGE_TO_3D_MODES = ImageTo3DGenerator.SUPPORTED_MODES | {"triposr", "hybrid_neural_symbolic"}
 
 class JobStatus(str, Enum):
     PENDING = "Pendente"
@@ -79,9 +80,9 @@ class JobCreate(BaseModel):
                     f"Extensão de imagem inválida '{ext}'. Formatos permitidos: {sorted(ALLOWED_IMAGE_EXTENSIONS.keys())}"
                 )
             mode = str(cleaned_params.get("mode", "silhouette")).strip().lower()
-            if mode not in ImageTo3DGenerator.SUPPORTED_MODES:
+            if mode not in SUPPORTED_IMAGE_TO_3D_MODES:
                 raise ValueError(
-                    f"Modo Image-to-3D inválido: '{mode}'. Modos suportados: {sorted(ImageTo3DGenerator.SUPPORTED_MODES)}"
+                    f"Modo Image-to-3D inválido: '{mode}'. Modos suportados: {sorted(SUPPORTED_IMAGE_TO_3D_MODES)}"
                 )
             cleaned_params["reference_image_filename"] = ref_img
             cleaned_params["mode"] = mode

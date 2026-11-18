@@ -12,6 +12,9 @@ class Settings(BaseModel):
     QUARANTINE_DIR: Path = STORAGE_DIR / ".quarantine"
     MODELS_DIR: Path = BASE_DIR / "models"
     DATABASE_URL: str = f"sqlite:///{BASE_DIR}/ai_3d_studio.db"
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    OLLAMA_VISION_MODEL: str = os.getenv("OLLAMA_VISION_MODEL", "llava")
+    OLLAMA_TIMEOUT_SECONDS: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "15.0"))
     
     ALLOWED_ORIGINS: list[str] = [
         "http://localhost:5173",

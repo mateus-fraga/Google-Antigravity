@@ -586,6 +586,7 @@ export const GenerationPanel: React.FC<GenerationPanelProps> = ({
                 <option value="silhouette">Extrusão de Silhueta 2D + Furos (Alpha / Otsu)</option>
                 <option value="heightmap">Mapa de Relevo / Altura por Luminância (Heightmap)</option>
                 <option value="triposr">Reconstrução Orgânica de Alta Fidelidade (TripoSR)</option>
+                <option value="hybrid_neural_symbolic">Híbrido Neuro-Simbólico (TripoSR + Smart Slicing)</option>
               </select>
             </div>
 
@@ -646,6 +647,10 @@ export const GenerationPanel: React.FC<GenerationPanelProps> = ({
                     style={inputStyle}
                   />
                 </div>
+              </div>
+            ) : imageMode === 'hybrid_neural_symbolic' ? (
+              <div style={{ fontSize: '11px', color: '#a1a1aa' }}>
+                Inspeção semântica via Vision LLM (Ollama) + reconstrução TripoSR + alinhamento PCA e corte estanque de base com preservação de cores.
               </div>
             ) : (
               <div style={{ fontSize: '11px', color: '#a1a1aa' }}>
